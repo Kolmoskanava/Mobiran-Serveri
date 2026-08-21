@@ -19,19 +19,24 @@ const activeUsers = {};
 io.on('connection', (socket) => {
   console.log('Laite yhdistetty:', socket.id);
 
+  // Rekisteröidään puhelinnumero tietylle socket-yhteydelle
   socket.on('register_number', (number) => {
     activeUsers[number] = socket.id;
     console.log(`Numero ${number} rekisteröity id:lle ${socket.id}`);
   });
 
+  // Puhelun aloitus: Välitetään soittajan numero SEKÄ kanava vastaanottajalle
   socket.on('start_call', (data) => {
     const targetSocketId = activeUsers[data.targetNumber];
     if (targetSocketId) {
-      io.to(targetSocketId).emit('incoming_call', { fromNumber: data.fromNumber });
+      io.to(targetSocketId).emit('incoming_call', { 
+        fromNumber: data.fromNumber,
+        channel: data.channel 
+      });
     }
   });
 
-  // UUSI LISÄYS: Välittää vastaustiedon soittajalle
+  // Vastaustieto soittajalle
   socket.on('answer_call', (data) => {
     const callerSocketId = activeUsers[data.targetNumber];
     if (callerSocketId) {
@@ -39,6 +44,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Puheen/äänen välitys 250ms pätkissä
   socket.on('audio_stream', (data) => {
     const targetSocketId = activeUsers[data.targetNumber];
     if (targetSocketId) {
@@ -46,6 +52,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Puhelun lopetus
   socket.on('end_call', (data) => {
     const targetSocketId = activeUsers[data.targetNumber];
     if (targetSocketId) {
@@ -53,6 +60,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Yhteyden katkeaminen ja numeron poisto rekisteristä
   socket.on('disconnect', () => {
     for (const [number, id] of Object.entries(activeUsers)) {
       if (id === socket.id) {
