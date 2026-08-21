@@ -8,43 +8,53 @@ app.use(cors());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
 const activeUsers = {};
+const inCallUsers = new Set(); // Seurataan varattuja numeroita
 
 io.on('connection', (socket) => {
-  console.log('Laite yhdistetty:', socket.id);
 
-  // Rekisteröidään puhelinnumero tietylle socket-yhteydelle
   socket.on('register_number', (number) => {
     activeUsers[number] = socket.id;
-    console.log(`Numero ${number} rekisteröity id:lle ${socket.id}`);
   });
 
-  // Puhelun aloitus: Välitetään soittajan numero SEKÄ kanava vastaanottajalle
   socket.on('start_call', (data) => {
     const targetSocketId = activeUsers[data.targetNumber];
+    
+    // TARKISTUS: Jos kohde on jo puhelussa
+    if (inCallUsers.has(data.targetNumber)) {
+      socket.emit('line_busy');
+      return;
+    }
+
     if (targetSocketId) {
+      // Merkitään soittaja puhelutilaan myöhempiä tarkistuksia varten
+      inCallUsers.add(data.fromNumber);
+      
       io.to(targetSocketId).emit('incoming_call', { 
         fromNumber: data.fromNumber,
         channel: data.channel 
       });
+    } else {
+      // Jos numeroa ei löydy linjoilta, lähetetään myös varattu-tieto
+      socket.emit('line_busy');
     }
   });
 
-  // Vastaustieto soittajalle
   socket.on('answer_call', (data) => {
+    // Merkitään myös vastaaja varatuksi kun puhelu yhdistyy
+    for (const [num, id] of Object.entries(activeUsers)) {
+      if (id === socket.id) inCallUsers.add(num);
+    }
+    
     const callerSocketId = activeUsers[data.targetNumber];
     if (callerSocketId) {
       io.to(callerSocketId).emit('call_answered');
     }
   });
 
-  // Puheen/äänen välitys 250ms pätkissä
   socket.on('audio_stream', (data) => {
     const targetSocketId = activeUsers[data.targetNumber];
     if (targetSocketId) {
@@ -52,23 +62,29 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Puhelun lopetus
   socket.on('end_call', (data) => {
+    // Vapautetaan molemmat numerot puhelun päättyessä
+    for (const [num, id] of Object.entries(activeUsers)) {
+      if (id === socket.id) inCallUsers.delete(num);
+    }
+    if (data && data.targetNumber) {
+      inCallUsers.delete(data.targetNumber);
+    }
+
     const targetSocketId = activeUsers[data.targetNumber];
     if (targetSocketId) {
       io.to(targetSocketId).emit('call_ended');
     }
   });
 
-  // Yhteyden katkeaminen ja numeron poisto rekisteristä
   socket.on('disconnect', () => {
     for (const [number, id] of Object.entries(activeUsers)) {
       if (id === socket.id) {
         delete activeUsers[number];
+        inCallUsers.delete(number);
         break;
       }
     }
-    console.log('Laite poistui:', socket.id);
   });
 });
 
