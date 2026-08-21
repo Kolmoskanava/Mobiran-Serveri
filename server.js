@@ -31,6 +31,14 @@ io.on('connection', (socket) => {
     }
   });
 
+  // UUSI LISÄYS: Välittää vastaustiedon soittajalle
+  socket.on('answer_call', (data) => {
+    const callerSocketId = activeUsers[data.targetNumber];
+    if (callerSocketId) {
+      io.to(callerSocketId).emit('call_answered');
+    }
+  });
+
   socket.on('audio_stream', (data) => {
     const targetSocketId = activeUsers[data.targetNumber];
     if (targetSocketId) {
