@@ -23,13 +23,16 @@ io.on('connection', (socket) => {
   socket.on('start_call', (data) => {
     const targetSocketId = activeUsers[data.targetNumber];
     
-    if (inCallUsers.has(data.targetNumber)) {
+    // Tarkistetaan, että kumpikaan osapuoli ei ole jo varattu
+    if (inCallUsers.has(data.targetNumber) || inCallUsers.has(data.fromNumber)) {
       socket.emit('line_busy');
       return;
     }
 
     if (targetSocketId) {
+      // Merkitään molemmat osapuolet varatuiksi
       inCallUsers.add(data.fromNumber);
+      inCallUsers.add(data.targetNumber);
       
       io.to(targetSocketId).emit('incoming_call', { 
         fromNumber: data.fromNumber,
@@ -51,7 +54,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- WEBRTC SIGNALISOINTI (Välittää yhteydenmuodostusviestit) ---
+  // --- WEBRTC SIGNALISOINTI ---
   socket.on('webrtc_offer', (data) => {
     const targetSocketId = activeUsers[data.targetNumber];
     if (targetSocketId) {
@@ -72,19 +75,21 @@ io.on('connection', (socket) => {
       io.to(targetSocketId).emit('webrtc_ice_candidate', { candidate: data.candidate });
     }
   });
-  // -------------------------------------------------------------
+  // -----------------------------
 
   socket.on('end_call', (data) => {
+    // Vapautetaan kaikki socketiin tai targetNumberiin liittyvät numerot varatusta tilasta
     for (const [num, id] of Object.entries(activeUsers)) {
-      if (id === socket.id) inCallUsers.delete(num);
+      if (id === socket.id) {
+        inCallUsers.delete(num);
+      }
     }
     if (data && data.targetNumber) {
       inCallUsers.delete(data.targetNumber);
-    }
-
-    const targetSocketId = activeUsers[data.targetNumber];
-    if (targetSocketId) {
-      io.to(targetSocketId).emit('call_ended');
+      const targetSocketId = activeUsers[data.targetNumber];
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('call_ended');
+      }
     }
   });
 
