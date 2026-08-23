@@ -6,6 +6,11 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
+// Lisätty reitti juuriosoitteelle, jotta fetch-pyynnöt eivät anna 404-virhettä
+app.get('/', (req, res) => {
+  res.status(200).send('Mobira Server Online');
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
