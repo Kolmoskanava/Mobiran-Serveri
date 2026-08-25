@@ -6,11 +6,8 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// Muutettu juurireitti palauttamaan myös IP-osoitteen JSON-muodossa
 app.get('/', (req, res) => {
-    // Haetaan IP (Renderin ja muiden proxyn takana x-forwarded-for on luotettavin)
     const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    
     res.status(200).json({
         status: 'Mobira Server Online',
         ip: clientIp
@@ -34,14 +31,12 @@ io.on('connection', (socket) => {
     socket.on('start_call', (data) => {
         const targetSocketId = activeUsers[data.targetNumber];
         
-        // Tarkistetaan, että kumpikaan osapuoli ei ole jo varattu
         if (inCallUsers.has(data.targetNumber) || inCallUsers.has(data.fromNumber)) {
             socket.emit('line_busy');
             return;
         }
 
         if (targetSocketId) {
-            // Merkitään molemmat osapuolet varatuiksi
             inCallUsers.add(data.fromNumber);
             inCallUsers.add(data.targetNumber);
             
@@ -55,11 +50,16 @@ io.on('connection', (socket) => {
     });
 
     socket.on('answer_call', (data) => {
+        let answeringNumber = null;
         for (const [num, id] of Object.entries(activeUsers)) {
-            if (id === socket.id) inCallUsers.add(num);
+            if (id === socket.id) {
+                answeringNumber = num;
+                inCallUsers.add(num);
+            }
         }
         
-        const callerSocketId = activeUsers[data.targetNumber];
+        const callerSocketId = activeUsers[data.targetNumber]; 
+        
         if (callerSocketId) {
             io.to(callerSocketId).emit('call_answered');
         }
