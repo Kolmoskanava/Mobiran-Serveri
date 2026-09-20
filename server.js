@@ -29,6 +29,61 @@ const io = new Server(server, {
 const activeUsers = {};
 const inCallUsers = new Set();
 
+/* =========================================
+   VASTAAMATTOMAT PUHELUT (KUTSU E)
+
+   missedCalls: { numero: Set(numerot, jotka ovat
+   soittaneet eikä niihin ole vastattu / soitettu
+   takaisin) }
+
+   ringingCalls: { kohdenumero: soittajanNumero }
+   Kertoo, kenelle soi juuri nyt vastaamaton
+   puhelu. Käytetään sen päättelyyn, oliko puhelu
+   vielä vastaamatta kun se päättyi.
+   ========================================= */
+
+const missedCalls = {};
+const ringingCalls = {};
+
+function addMissedCall(targetNumber, fromNumber) {
+    if (!targetNumber || !fromNumber) return;
+
+    if (!missedCalls[targetNumber]) {
+        missedCalls[targetNumber] = new Set();
+    }
+
+    missedCalls[targetNumber].add(fromNumber);
+
+    console.log(
+        `Vastaamaton puhelu merkitty: ${fromNumber} -> ${targetNumber}`
+    );
+
+    const targetSocketId = activeUsers[targetNumber];
+
+    if (targetSocketId) {
+        io.to(targetSocketId).emit('missed_call', {
+            fromNumber: fromNumber
+        });
+    }
+}
+
+function clearMissedCall(numberThatMissed, fromNumber) {
+    if (
+        missedCalls[numberThatMissed] &&
+        missedCalls[numberThatMissed].has(fromNumber)
+    ) {
+        missedCalls[numberThatMissed].delete(fromNumber);
+
+        if (missedCalls[numberThatMissed].size === 0) {
+            delete missedCalls[numberThatMissed];
+        }
+
+        console.log(
+            `Vastaamaton puhelu kuitattu: ${numberThatMissed} soitti takaisin ${fromNumber}`
+        );
+    }
+}
+
 io.on('connection', (socket) => {
 
     /* =========================================
@@ -46,6 +101,21 @@ io.on('connection', (socket) => {
         console.log(
             `Numero ${number} rekisteröity socketiin ${socket.id}`
         );
+
+        /*
+         * Jos numerolle on kertynyt vastaamattomia
+         * puheluita sillä aikaa kun se ei ollut
+         * verkossa (esim. html kiinni), ilmoitetaan
+         * ne nyt kaikki.
+         */
+
+        if (missedCalls[number] && missedCalls[number].size > 0) {
+            missedCalls[number].forEach((fromNumber) => {
+                socket.emit('missed_call', {
+                    fromNumber: fromNumber
+                });
+            });
+        }
     });
 
 
@@ -132,6 +202,16 @@ io.on('connection', (socket) => {
 
 
         /*
+         * Jos fromNumber soittaa nyt targetNumberille
+         * ja fromNumberilla on merkittynä vastaamaton
+         * puhelu juuri tältä numerolta, tämä lasketaan
+         * kuittaukseksi - KUTSU E sammuu.
+         */
+
+        clearMissedCall(fromNumber, targetNumber);
+
+
+        /*
          * Etsitään vastaanottajan socket.
          */
 
@@ -156,10 +236,16 @@ io.on('connection', (socket) => {
 
 
         /*
-         * Vastaanottajaa ei ole verkossa.
+         * Vastaanottajaa ei ole verkossa
+         * (esim. html on kiinni). Merkitään
+         * vastaamattomaksi puheluksi, jotta
+         * se odottaa vastaanottajaa kun tämä
+         * seuraavan kerran rekisteröityy.
          */
 
         if (!targetSocketId) {
+
+            addMissedCall(targetNumber, fromNumber);
 
             socket.emit('line_busy');
 
@@ -219,6 +305,14 @@ io.on('connection', (socket) => {
         inCallUsers.add(targetNumber);
 
 
+        /*
+         * Merkitään puhelu soimaan vastaamatta,
+         * kunnes joko vastataan tai se päättyy.
+         */
+
+        ringingCalls[targetNumber] = fromNumber;
+
+
         /* =====================================
            LÄHETETÄÄN TULEVA PUHELU
            ===================================== */
@@ -274,6 +368,20 @@ io.on('connection', (socket) => {
 
                 break;
             }
+        }
+
+
+        /*
+         * Puheluun vastattiin - se ei ole enää
+         * soimassa vastaamatta.
+         */
+
+        if (
+            answeringNumber &&
+            ringingCalls[answeringNumber]
+        ) {
+
+            delete ringingCalls[answeringNumber];
         }
 
 
@@ -385,9 +493,10 @@ io.on('connection', (socket) => {
     socket.on('end_call', (data) => {
 
         /*
-         * Poistetaan tämän socketin numero
-         * aktiivisesta puhelusta.
+         * Selvitetään tämän socketin oma numero.
          */
+
+        let thisNumber = null;
 
         for (
             const [num, id]
@@ -395,6 +504,8 @@ io.on('connection', (socket) => {
         ) {
 
             if (id === socket.id) {
+
+                thisNumber = num;
 
                 inCallUsers.delete(num);
             }
@@ -416,6 +527,41 @@ io.on('connection', (socket) => {
             inCallUsers.delete(
                 targetNumber
             );
+
+
+            /*
+             * Jos thisNumber oli soittamassa
+             * targetNumberille eikä tämä ehtinyt
+             * vastata, merkitään puhelu
+             * vastaamattomaksi targetNumberille.
+             */
+
+            if (
+                thisNumber &&
+                ringingCalls[targetNumber] === thisNumber
+            ) {
+
+                addMissedCall(
+                    targetNumber,
+                    thisNumber
+                );
+
+                delete ringingCalls[targetNumber];
+
+            } else if (
+                thisNumber &&
+                ringingCalls[thisNumber] === targetNumber
+            ) {
+
+                /*
+                 * thisNumber oli itse vastaamatta
+                 * soivan puhelun vastaanottaja ja
+                 * katkaisi sen itse (esim. hylkäsi) -
+                 * tätä ei lasketa vastaamattomaksi.
+                 */
+
+                delete ringingCalls[thisNumber];
+            }
 
 
             const targetSocketId =
@@ -448,6 +594,41 @@ io.on('connection', (socket) => {
                 delete activeUsers[number];
 
                 inCallUsers.delete(number);
+
+
+                /*
+                 * Jos tälle numerolle oli juuri
+                 * soimassa vastaamaton puhelu ja
+                 * yhteys katkesi (esim. html
+                 * suljettiin), merkitään se
+                 * vastaamattomaksi ja kerrotaan
+                 * soittajalle että puhelu päättyi.
+                 */
+
+                if (ringingCalls[number]) {
+
+                    const fromNumber =
+                        ringingCalls[number];
+
+                    addMissedCall(
+                        number,
+                        fromNumber
+                    );
+
+                    delete ringingCalls[number];
+
+                    inCallUsers.delete(fromNumber);
+
+                    const callerSocketId =
+                        activeUsers[fromNumber];
+
+                    if (callerSocketId) {
+
+                        io.to(callerSocketId).emit(
+                            'call_ended'
+                        );
+                    }
+                }
 
                 console.log(
                     `Numero ${number} poistui verkosta`
