@@ -31,11 +31,6 @@ const inCallUsers = new Set();
 
 /* =========================================
    VASTAAMATTOMAT PUHELUT
-
-   missedCalls: numerolle kertyneet vastaamattomat
-   puhelut.
-
-   ringingCalls: kohdenumero -> soittajan numero.
    ========================================= */
 
 const missedCalls = {};
@@ -92,13 +87,9 @@ function bindNumber(socket, number) {
 }
 
 function numberOfSocket(socket) {
-    const n =
-        socket.mobiraInfo &&
-        socket.mobiraInfo.phoneNumber;
+    const n = socket.mobiraInfo && socket.mobiraInfo.phoneNumber;
 
-    if (n && activeUsers[n] === socket.id) {
-        return n;
-    }
+    if (n && activeUsers[n] === socket.id) return n;
 
     for (const [num, id] of Object.entries(activeUsers)) {
         if (id === socket.id) return num;
@@ -115,10 +106,7 @@ io.on('connection', (socket) => {
 
     socket.on('register_number', (number) => {
         if (number && typeof number === 'object') {
-            number =
-                number.number ??
-                number.phoneNumber ??
-                number.fromNumber;
+            number = number.number ?? number.phoneNumber ?? number.fromNumber;
         }
 
         number = String(number ?? '').trim();
@@ -131,10 +119,7 @@ io.on('connection', (socket) => {
             `Numero ${number} rekisteröity socketiin ${socket.id}`
         );
 
-        if (
-            missedCalls[number] &&
-            missedCalls[number].size > 0
-        ) {
+        if (missedCalls[number] && missedCalls[number].size > 0) {
             missedCalls[number].forEach((fromNumber) => {
                 socket.emit('missed_call', {
                     fromNumber: fromNumber
@@ -156,10 +141,11 @@ io.on('connection', (socket) => {
                     ? data.deviceType
                     : null,
 
-            hiddenChannel: !!(
-                data &&
-                data.hiddenChannel
-            ),
+            hiddenChannel:
+                !!(
+                    data &&
+                    data.hiddenChannel
+                ),
 
             currentChannel:
                 data &&
@@ -195,13 +181,14 @@ io.on('connection', (socket) => {
 
     socket.on('start_call', (data) => {
         const fromNumber =
-            String(data.fromNumber || '').trim();
+            String(data.fromNumber || '');
 
         const targetNumber =
-            String(data.targetNumber || '').trim();
+            String(data.targetNumber || '');
 
         /*
-         * Puuttuva numero ei aiheuta varattuääntä.
+         * Puuttuva numero:
+         * ei dial tonea eikä varattuääntä.
          */
 
         if (!fromNumber || !targetNumber) {
@@ -232,7 +219,7 @@ io.on('connection', (socket) => {
         clearMissedCall(fromNumber, targetNumber);
 
         /*
-         * Tarkistetaan vastaanottajan verkkoyhteys.
+         * Etsitään vastaanottajan socket.
          */
 
         const targetSocketId =
@@ -240,7 +227,7 @@ io.on('connection', (socket) => {
 
         /*
          * Jos jompikumpi on jo puhelussa,
-         * kyseessä on oikeasti varattu linja.
+         * ilmoitetaan oikeasta varatusta linjasta.
          */
 
         if (
@@ -258,16 +245,17 @@ io.on('connection', (socket) => {
         }
 
         /*
-         * Vastaanottajan laite ei ole verkossa.
+         * Vastaanottajan puhelin ei ole verkossa.
          *
-         * Ei lähetetä line_busy-tapahtumaa, joten
-         * asiakkaan ei pitäisi soittaa varattuääntä.
+         * Ei lähetetä line_busy-tapahtumaa.
+         * Näin asiakas ei käsittele tilannetta
+         * varattuna linjana.
          */
 
         if (!targetSocketId) {
             console.log(
-                `Kohdetta ${targetNumber} ei ole verkossa. ` +
-                `Verkossa olevat numerot: [${Object.keys(activeUsers).join(', ')}]`
+                `Kohdetta ${targetNumber} ei ole rekisteröity. ` +
+                `Verkossa: [${Object.keys(activeUsers).join(', ')}]`
             );
 
             addMissedCall(targetNumber, fromNumber);
@@ -288,7 +276,7 @@ io.on('connection', (socket) => {
             data.channel ?? null;
 
         /*
-         * Cityman käyttää vastaanottajan nykyistä kanavaa.
+         * Cityman käyttää vastaanottajan kanavaa.
          */
 
         if (
@@ -321,9 +309,21 @@ io.on('connection', (socket) => {
 
         ringingCalls[targetNumber] = fromNumber;
 
-        /* =====================================
-           LÄHETETÄÄN TULEVA PUHELU
-           ===================================== */
+        /*
+         * Vahvistetaan soittajalle, että kohde
+         * on verkossa ja puheluyritys voi alkaa.
+         *
+         * Asiakkaan pitää käynnistää dial tone
+         * vasta saatuaan tämän tapahtuman.
+         */
+
+        socket.emit('call_ringing', {
+            targetNumber: targetNumber
+        });
+
+        /*
+         * Lähetetään tuleva puhelu vastaanottajalle.
+         */
 
         io.to(targetSocketId).emit('incoming_call', {
             fromNumber: fromNumber,
@@ -340,8 +340,7 @@ io.on('connection', (socket) => {
        ========================================= */
 
     socket.on('answer_call', (data) => {
-        const answeringNumber =
-            numberOfSocket(socket);
+        const answeringNumber = numberOfSocket(socket);
 
         if (answeringNumber) {
             inCallUsers.add(answeringNumber);
@@ -354,14 +353,17 @@ io.on('connection', (socket) => {
             delete ringingCalls[answeringNumber];
         }
 
+        /*
+         * targetNumber on soittajan numero.
+         */
+
         const callerSocketId =
             activeUsers[data.targetNumber];
 
         if (callerSocketId) {
             io.to(callerSocketId).emit('call_answered', {
                 channel:
-                    data &&
-                    data.channel != null
+                    data && data.channel != null
                         ? data.channel
                         : null
             });
@@ -422,8 +424,7 @@ io.on('connection', (socket) => {
        ========================================= */
 
     socket.on('end_call', (data) => {
-        const thisNumber =
-            numberOfSocket(socket);
+        const thisNumber = numberOfSocket(socket);
 
         if (thisNumber) {
             inCallUsers.delete(thisNumber);
@@ -436,8 +437,8 @@ io.on('connection', (socket) => {
             inCallUsers.delete(targetNumber);
 
             /*
-             * Jos puhelu ehti soida mutta siihen ei vastattu,
-             * merkitään se vastaamattomaksi.
+             * Jos vastaanottaja ei ehtinyt vastata,
+             * merkitään puhelu vastaamattomaksi.
              */
 
             if (
@@ -482,8 +483,9 @@ io.on('connection', (socket) => {
                 inCallUsers.delete(number);
 
                 /*
-                 * Jos laite poistuu verkosta puhelun soidessa,
-                 * tallennetaan puhelu vastaamattomaksi.
+                 * Jos laite poistuu verkosta puhelun
+                 * soidessa, tallennetaan puhelu
+                 * vastaamattomaksi.
                  */
 
                 if (ringingCalls[number]) {
