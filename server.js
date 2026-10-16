@@ -84,6 +84,29 @@ function clearMissedCall(numberThatMissed, fromNumber) {
     }
 }
 
+/* =========================================
+   APUFUNKTIOT: numeron ja socketin sidonta
+   ========================================= */
+
+function bindNumber(socket, number) {
+    activeUsers[number] = socket.id;
+
+    socket.mobiraInfo = socket.mobiraInfo || {};
+    socket.mobiraInfo.phoneNumber = number;
+}
+
+function numberOfSocket(socket) {
+    const n = socket.mobiraInfo && socket.mobiraInfo.phoneNumber;
+
+    if (n && activeUsers[n] === socket.id) return n;
+
+    for (const [num, id] of Object.entries(activeUsers)) {
+        if (id === socket.id) return num;
+    }
+
+    return null;
+}
+
 io.on('connection', (socket) => {
 
     /* =========================================
@@ -91,12 +114,15 @@ io.on('connection', (socket) => {
        ========================================= */
 
     socket.on('register_number', (number) => {
-        number = String(number);
+        if (number && typeof number === 'object') {
+            number = number.number ?? number.phoneNumber ?? number.fromNumber;
+        }
 
-        activeUsers[number] = socket.id;
+        number = String(number ?? '').trim();
 
-        socket.mobiraInfo = socket.mobiraInfo || {};
-        socket.mobiraInfo.phoneNumber = number;
+        if (!number) return;
+
+        bindNumber(socket, number);
 
         console.log(
             `Numero ${number} rekisteröity socketiin ${socket.id}`
@@ -202,6 +228,22 @@ io.on('connection', (socket) => {
 
 
         /*
+         * Soittajan numero sidotaan aina tähän socketiin.
+         * Muuten palvelin ei löydä soittajaa, kun puhelu
+         * päättyy (end_call), ja soittaja jää ikuisesti
+         * "puhelussa"-listalle = kaikki puhelut tulevat varattuna.
+         */
+
+        if (activeUsers[fromNumber] !== socket.id) {
+            bindNumber(socket, fromNumber);
+
+            console.log(
+                `Soittaja ${fromNumber} sidottu sockettiin ${socket.id}`
+            );
+        }
+
+
+        /*
          * Jos fromNumber soittaa nyt targetNumberille
          * ja fromNumberilla on merkittynä vastaamaton
          * puhelu juuri tältä numerolta, tämä lasketaan
@@ -229,6 +271,11 @@ io.on('connection', (socket) => {
             inCallUsers.has(fromNumber)
         ) {
 
+            console.log(
+                `Varattu: ${fromNumber} -> ${targetNumber}. ` +
+                `Puhelussa: [${[...inCallUsers].join(', ')}]`
+            );
+
             socket.emit('line_busy');
 
             return;
@@ -244,6 +291,11 @@ io.on('connection', (socket) => {
          */
 
         if (!targetSocketId) {
+
+            console.log(
+                `Kohdetta ${targetNumber} ei ole rekisteröity. ` +
+                `Verkossa: [${Object.keys(activeUsers).join(', ')}]`
+            );
 
             addMissedCall(targetNumber, fromNumber);
 
@@ -348,26 +400,10 @@ io.on('connection', (socket) => {
 
     socket.on('answer_call', (data) => {
 
-        let answeringNumber = null;
+        const answeringNumber = numberOfSocket(socket);
 
-
-        /*
-         * Selvitetään, mikä numero vastasi.
-         */
-
-        for (
-            const [num, id]
-            of Object.entries(activeUsers)
-        ) {
-
-            if (id === socket.id) {
-
-                answeringNumber = num;
-
-                inCallUsers.add(num);
-
-                break;
-            }
+        if (answeringNumber) {
+            inCallUsers.add(answeringNumber);
         }
 
 
@@ -496,19 +532,10 @@ io.on('connection', (socket) => {
          * Selvitetään tämän socketin oma numero.
          */
 
-        let thisNumber = null;
+        const thisNumber = numberOfSocket(socket);
 
-        for (
-            const [num, id]
-            of Object.entries(activeUsers)
-        ) {
-
-            if (id === socket.id) {
-
-                thisNumber = num;
-
-                inCallUsers.delete(num);
-            }
+        if (thisNumber) {
+            inCallUsers.delete(thisNumber);
         }
 
 
