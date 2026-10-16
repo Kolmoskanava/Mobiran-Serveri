@@ -30,16 +30,12 @@ const activeUsers = {};
 const inCallUsers = new Set();
 
 /* =========================================
-   VASTAAMATTOMAT PUHELUT (KUTSU E)
+   VASTAAMATTOMAT PUHELUT
 
-   missedCalls: { numero: Set(numerot, jotka ovat
-   soittaneet eikä niihin ole vastattu / soitettu
-   takaisin) }
+   missedCalls: numerolle kertyneet vastaamattomat
+   puhelut.
 
-   ringingCalls: { kohdenumero: soittajanNumero }
-   Kertoo, kenelle soi juuri nyt vastaamaton
-   puhelu. Käytetään sen päättelyyn, oliko puhelu
-   vielä vastaamatta kun se päättyi.
+   ringingCalls: kohdenumero -> soittajan numero.
    ========================================= */
 
 const missedCalls = {};
@@ -85,7 +81,7 @@ function clearMissedCall(numberThatMissed, fromNumber) {
 }
 
 /* =========================================
-   APUFUNKTIOT: numeron ja socketin sidonta
+   APUFUNKTIOT
    ========================================= */
 
 function bindNumber(socket, number) {
@@ -96,9 +92,13 @@ function bindNumber(socket, number) {
 }
 
 function numberOfSocket(socket) {
-    const n = socket.mobiraInfo && socket.mobiraInfo.phoneNumber;
+    const n =
+        socket.mobiraInfo &&
+        socket.mobiraInfo.phoneNumber;
 
-    if (n && activeUsers[n] === socket.id) return n;
+    if (n && activeUsers[n] === socket.id) {
+        return n;
+    }
 
     for (const [num, id] of Object.entries(activeUsers)) {
         if (id === socket.id) return num;
@@ -115,7 +115,10 @@ io.on('connection', (socket) => {
 
     socket.on('register_number', (number) => {
         if (number && typeof number === 'object') {
-            number = number.number ?? number.phoneNumber ?? number.fromNumber;
+            number =
+                number.number ??
+                number.phoneNumber ??
+                number.fromNumber;
         }
 
         number = String(number ?? '').trim();
@@ -128,14 +131,10 @@ io.on('connection', (socket) => {
             `Numero ${number} rekisteröity socketiin ${socket.id}`
         );
 
-        /*
-         * Jos numerolle on kertynyt vastaamattomia
-         * puheluita sillä aikaa kun se ei ollut
-         * verkossa (esim. html kiinni), ilmoitetaan
-         * ne nyt kaikki.
-         */
-
-        if (missedCalls[number] && missedCalls[number].size > 0) {
+        if (
+            missedCalls[number] &&
+            missedCalls[number].size > 0
+        ) {
             missedCalls[number].forEach((fromNumber) => {
                 socket.emit('missed_call', {
                     fromNumber: fromNumber
@@ -144,17 +143,11 @@ io.on('connection', (socket) => {
         }
     });
 
-
     /* =========================================
        LAITTEEN REKISTERÖINTI
-
-       Cityman käyttää tätä ilmoittaakseen:
-       - olevansa CITYMAN
-       - että kanava on käyttäjältä piilossa
        ========================================= */
 
     socket.on('register_device', (data) => {
-
         socket.mobiraInfo = {
             ...(socket.mobiraInfo || {}),
 
@@ -163,11 +156,10 @@ io.on('connection', (socket) => {
                     ? data.deviceType
                     : null,
 
-            hiddenChannel:
-                !!(
-                    data &&
-                    data.hiddenChannel
-                ),
+            hiddenChannel: !!(
+                data &&
+                data.hiddenChannel
+            ),
 
             currentChannel:
                 data &&
@@ -182,56 +174,47 @@ io.on('connection', (socket) => {
         );
     });
 
-
     /* =========================================
-       NMT:N KANAVAN VAIHTUMINEN
-
-       Jeikin NMT ilmoittaa aina uuden kanavan.
-
-       Esimerkiksi:
-       set_channel("1H")
-       set_channel("6H")
+       KANAVAN VAIHTUMINEN
        ========================================= */
 
     socket.on('set_channel', (channel) => {
-
         socket.mobiraInfo =
             socket.mobiraInfo || {};
 
-        socket.mobiraInfo.currentChannel =
-            channel;
+        socket.mobiraInfo.currentChannel = channel;
 
         console.log(
             `Socket ${socket.id} kanava: ${channel}`
         );
     });
 
-
     /* =========================================
        PUHELUN ALOITUS
        ========================================= */
 
     socket.on('start_call', (data) => {
-
         const fromNumber =
-            String(data.fromNumber || '');
+            String(data.fromNumber || '').trim();
 
         const targetNumber =
-            String(data.targetNumber || '');
+            String(data.targetNumber || '').trim();
+
+        /*
+         * Puuttuva numero ei aiheuta varattuääntä.
+         */
 
         if (!fromNumber || !targetNumber) {
-
-            socket.emit('line_busy');
+            socket.emit('number_unavailable', {
+                targetNumber,
+                reason: 'invalid_number'
+            });
 
             return;
         }
 
-
         /*
-         * Soittajan numero sidotaan aina tähän socketiin.
-         * Muuten palvelin ei löydä soittajaa, kun puhelu
-         * päättyy (end_call), ja soittaja jää ikuisesti
-         * "puhelussa"-listalle = kaikki puhelut tulevat varattuna.
+         * Sidotaan soittajan numero socketiin.
          */
 
         if (activeUsers[fromNumber] !== socket.id) {
@@ -242,35 +225,28 @@ io.on('connection', (socket) => {
             );
         }
 
-
         /*
-         * Jos fromNumber soittaa nyt targetNumberille
-         * ja fromNumberilla on merkittynä vastaamaton
-         * puhelu juuri tältä numerolta, tämä lasketaan
-         * kuittaukseksi - KUTSU E sammuu.
+         * Takaisinsoitto kuittaa vastaamattoman puhelun.
          */
 
         clearMissedCall(fromNumber, targetNumber);
 
-
         /*
-         * Etsitään vastaanottajan socket.
+         * Tarkistetaan vastaanottajan verkkoyhteys.
          */
 
         const targetSocketId =
             activeUsers[targetNumber];
 
-
         /*
          * Jos jompikumpi on jo puhelussa,
-         * linja on varattu.
+         * kyseessä on oikeasti varattu linja.
          */
 
         if (
             inCallUsers.has(targetNumber) ||
             inCallUsers.has(fromNumber)
         ) {
-
             console.log(
                 `Varattu: ${fromNumber} -> ${targetNumber}. ` +
                 `Puhelussa: [${[...inCallUsers].join(', ')}]`
@@ -281,29 +257,28 @@ io.on('connection', (socket) => {
             return;
         }
 
-
         /*
-         * Vastaanottajaa ei ole verkossa
-         * (esim. html on kiinni). Merkitään
-         * vastaamattomaksi puheluksi, jotta
-         * se odottaa vastaanottajaa kun tämä
-         * seuraavan kerran rekisteröityy.
+         * Vastaanottajan laite ei ole verkossa.
+         *
+         * Ei lähetetä line_busy-tapahtumaa, joten
+         * asiakkaan ei pitäisi soittaa varattuääntä.
          */
 
         if (!targetSocketId) {
-
             console.log(
-                `Kohdetta ${targetNumber} ei ole rekisteröity. ` +
-                `Verkossa: [${Object.keys(activeUsers).join(', ')}]`
+                `Kohdetta ${targetNumber} ei ole verkossa. ` +
+                `Verkossa olevat numerot: [${Object.keys(activeUsers).join(', ')}]`
             );
 
             addMissedCall(targetNumber, fromNumber);
 
-            socket.emit('line_busy');
+            socket.emit('number_unavailable', {
+                targetNumber,
+                reason: 'offline'
+            });
 
             return;
         }
-
 
         /* =====================================
            KANAVAN KÄSITTELY
@@ -312,42 +287,26 @@ io.on('connection', (socket) => {
         let callChannel =
             data.channel ?? null;
 
-
         /*
-         * CITYMAN
-         *
-         * Citymanilla ei ole käyttäjän näkyvää
-         * kanavaa.
-         *
-         * Jos Cityman soittaa NMT:lle,
-         * serveri ottaa kohde-NMT:n nykyisen
-         * kanavan Citymanin puhelun kanavaksi.
+         * Cityman käyttää vastaanottajan nykyistä kanavaa.
          */
 
         if (
             data.cityman === true ||
             data.deviceType === 'CITYMAN'
         ) {
-
             const targetSocket =
-                io.sockets.sockets.get(
-                    targetSocketId
-                );
-
+                io.sockets.sockets.get(targetSocketId);
 
             if (
                 targetSocket &&
                 targetSocket.mobiraInfo &&
                 targetSocket.mobiraInfo.currentChannel != null
             ) {
-
                 callChannel =
-                    targetSocket
-                        .mobiraInfo
-                        .currentChannel;
+                    targetSocket.mobiraInfo.currentChannel;
             }
         }
-
 
         /* =====================================
            MERKITÄÄN PUHELUN OSAPUOLET
@@ -356,218 +315,135 @@ io.on('connection', (socket) => {
         inCallUsers.add(fromNumber);
         inCallUsers.add(targetNumber);
 
-
         /*
-         * Merkitään puhelu soimaan vastaamatta,
-         * kunnes joko vastataan tai se päättyy.
+         * Merkitään puhelu soimaan.
          */
 
         ringingCalls[targetNumber] = fromNumber;
-
 
         /* =====================================
            LÄHETETÄÄN TULEVA PUHELU
            ===================================== */
 
-        io.to(targetSocketId).emit(
-            'incoming_call',
-            {
-                fromNumber: fromNumber,
-
-                /*
-                 * Tämä voi olla esimerkiksi:
-                 * 1H
-                 * 6H
-                 *
-                 * Cityman ei kuitenkaan näytä
-                 * tätä käyttäjälle.
-                 */
-
-                channel: callChannel
-            }
-        );
-
+        io.to(targetSocketId).emit('incoming_call', {
+            fromNumber: fromNumber,
+            channel: callChannel
+        });
 
         console.log(
             `Puhelu ${fromNumber} -> ${targetNumber}, kanava: ${callChannel}`
         );
     });
 
-
     /* =========================================
        PUHELUUN VASTAAMINEN
        ========================================= */
 
     socket.on('answer_call', (data) => {
-
-        const answeringNumber = numberOfSocket(socket);
+        const answeringNumber =
+            numberOfSocket(socket);
 
         if (answeringNumber) {
             inCallUsers.add(answeringNumber);
         }
 
-
-        /*
-         * Puheluun vastattiin - se ei ole enää
-         * soimassa vastaamatta.
-         */
-
         if (
             answeringNumber &&
             ringingCalls[answeringNumber]
         ) {
-
             delete ringingCalls[answeringNumber];
         }
-
-
-        /*
-         * targetNumber on soittajan numero.
-         */
 
         const callerSocketId =
             activeUsers[data.targetNumber];
 
-
         if (callerSocketId) {
-
-            io.to(callerSocketId).emit(
-                'call_answered',
-                {
-                    channel:
-                        data &&
-                        data.channel != null
-                            ? data.channel
-                            : null
-                }
-            );
+            io.to(callerSocketId).emit('call_answered', {
+                channel:
+                    data &&
+                    data.channel != null
+                        ? data.channel
+                        : null
+            });
         }
     });
-
 
     /* =========================================
        WEBRTC OFFER
        ========================================= */
 
     socket.on('webrtc_offer', (data) => {
-
         const targetSocketId =
             activeUsers[data.targetNumber];
 
-
         if (targetSocketId) {
-
-            io.to(targetSocketId).emit(
-                'webrtc_offer',
-                {
-                    fromNumber:
-                        data.fromNumber,
-
-                    offer:
-                        data.offer
-                }
-            );
+            io.to(targetSocketId).emit('webrtc_offer', {
+                fromNumber: data.fromNumber,
+                offer: data.offer
+            });
         }
     });
-
 
     /* =========================================
        WEBRTC ANSWER
        ========================================= */
 
     socket.on('webrtc_answer', (data) => {
-
         const targetSocketId =
             activeUsers[data.targetNumber];
 
-
         if (targetSocketId) {
-
-            io.to(targetSocketId).emit(
-                'webrtc_answer',
-                {
-                    answer:
-                        data.answer
-                }
-            );
+            io.to(targetSocketId).emit('webrtc_answer', {
+                answer: data.answer
+            });
         }
     });
-
 
     /* =========================================
        WEBRTC ICE
        ========================================= */
 
-    socket.on(
-        'webrtc_ice_candidate',
-        (data) => {
+    socket.on('webrtc_ice_candidate', (data) => {
+        const targetSocketId =
+            activeUsers[data.targetNumber];
 
-            const targetSocketId =
-                activeUsers[
-                    data.targetNumber
-                ];
-
-
-            if (targetSocketId) {
-
-                io.to(targetSocketId).emit(
-                    'webrtc_ice_candidate',
-                    {
-                        candidate:
-                            data.candidate
-                    }
-                );
-            }
+        if (targetSocketId) {
+            io.to(targetSocketId).emit(
+                'webrtc_ice_candidate',
+                {
+                    candidate: data.candidate
+                }
+            );
         }
-    );
-
+    });
 
     /* =========================================
        PUHELUN LOPETUS
        ========================================= */
 
     socket.on('end_call', (data) => {
-
-        /*
-         * Selvitetään tämän socketin oma numero.
-         */
-
-        const thisNumber = numberOfSocket(socket);
+        const thisNumber =
+            numberOfSocket(socket);
 
         if (thisNumber) {
             inCallUsers.delete(thisNumber);
         }
 
-
-        /*
-         * Poistetaan myös vastapuoli.
-         */
-
-        if (
-            data &&
-            data.targetNumber
-        ) {
-
+        if (data && data.targetNumber) {
             const targetNumber =
                 String(data.targetNumber);
 
-            inCallUsers.delete(
-                targetNumber
-            );
-
+            inCallUsers.delete(targetNumber);
 
             /*
-             * Jos thisNumber oli soittamassa
-             * targetNumberille eikä tämä ehtinyt
-             * vastata, merkitään puhelu
-             * vastaamattomaksi targetNumberille.
+             * Jos puhelu ehti soida mutta siihen ei vastattu,
+             * merkitään se vastaamattomaksi.
              */
 
             if (
                 thisNumber &&
                 ringingCalls[targetNumber] === thisNumber
             ) {
-
                 addMissedCall(
                     targetNumber,
                     thisNumber
@@ -579,61 +455,38 @@ io.on('connection', (socket) => {
                 thisNumber &&
                 ringingCalls[thisNumber] === targetNumber
             ) {
-
-                /*
-                 * thisNumber oli itse vastaamatta
-                 * soivan puhelun vastaanottaja ja
-                 * katkaisi sen itse (esim. hylkäsi) -
-                 * tätä ei lasketa vastaamattomaksi.
-                 */
-
                 delete ringingCalls[thisNumber];
             }
-
 
             const targetSocketId =
                 activeUsers[targetNumber];
 
-
             if (targetSocketId) {
-
-                io.to(targetSocketId).emit(
-                    'call_ended'
-                );
+                io.to(targetSocketId).emit('call_ended');
             }
         }
     });
 
-
     /* =========================================
-       DISCONNECT
+       YHTEYDEN KATKEAMINEN
        ========================================= */
 
     socket.on('disconnect', () => {
-
         for (
             const [number, id]
             of Object.entries(activeUsers)
         ) {
-
             if (id === socket.id) {
-
                 delete activeUsers[number];
 
                 inCallUsers.delete(number);
 
-
                 /*
-                 * Jos tälle numerolle oli juuri
-                 * soimassa vastaamaton puhelu ja
-                 * yhteys katkesi (esim. html
-                 * suljettiin), merkitään se
-                 * vastaamattomaksi ja kerrotaan
-                 * soittajalle että puhelu päättyi.
+                 * Jos laite poistuu verkosta puhelun soidessa,
+                 * tallennetaan puhelu vastaamattomaksi.
                  */
 
                 if (ringingCalls[number]) {
-
                     const fromNumber =
                         ringingCalls[number];
 
@@ -650,7 +503,6 @@ io.on('connection', (socket) => {
                         activeUsers[fromNumber];
 
                     if (callerSocketId) {
-
                         io.to(callerSocketId).emit(
                             'call_ended'
                         );
@@ -665,9 +517,7 @@ io.on('connection', (socket) => {
             }
         }
     });
-
 });
-
 
 /* =========================================
    SERVERIN KÄYNNISTYS
@@ -676,12 +526,8 @@ io.on('connection', (socket) => {
 const PORT =
     process.env.PORT || 3000;
 
-server.listen(
-    PORT,
-    () => {
-
-        console.log(
-            `Mobira-palvelin pyörii portissa ${PORT}`
-        );
-    }
-);
+server.listen(PORT, () => {
+    console.log(
+        `Mobira-palvelin pyörii portissa ${PORT}`
+    );
+});
