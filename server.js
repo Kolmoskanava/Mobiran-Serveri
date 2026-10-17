@@ -187,6 +187,22 @@ io.on('connection', (socket) => {
     });
 
     /* =========================================
+       VASTAAMATTOMIEN PUHELUIDEN NOLLAUS (CL pohjassa)
+       ========================================= */
+
+    socket.on('clear_missed_calls', () => {
+        const n = numberOfSocket(socket);
+
+        if (n && missedCalls[n]) {
+            delete missedCalls[n];
+
+            console.log(
+                `Vastaamattomat puhelut nollattu: ${n}`
+            );
+        }
+    });
+
+    /* =========================================
        LAITTEEN REKISTERÖINTI
        ========================================= */
 
@@ -419,6 +435,17 @@ io.on('connection', (socket) => {
             ringingCalls[answeringNumber]
         ) {
             delete ringingCalls[answeringNumber];
+        }
+
+        /*
+         * Vastattu puhelu ei ole enää vastaamaton.
+         */
+
+        if (answeringNumber && data && data.targetNumber) {
+            clearMissedCall(
+                answeringNumber,
+                String(data.targetNumber)
+            );
         }
 
         /*
