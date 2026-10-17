@@ -30,6 +30,36 @@ const activeUsers = {};
 const inCallUsers = new Set();
 
 /* =========================================
+   VERKKOTYYPPI (ARP / NMT)
+   ========================================= */
+
+/*
+ * numero -> verkkotyyppi, esim. '21028' -> 'ARP'.
+ * Täyttyy, kun ARP-puhelin lähettää register_network- tai
+ * start_call-viestin. Lisäksi kaikki 210xx-numerot (5 numeroa)
+ * tunnistetaan ARP-numeroiksi.
+ */
+const numberNetwork = {};
+
+function networkOf(number) {
+    number = String(number ?? '');
+
+    if (numberNetwork[number]) return numberNetwork[number];
+    if (/^210\d{2}$/.test(number)) return 'ARP';
+
+    return null;
+}
+
+function setNetwork(number, network) {
+    number = String(number ?? '').trim();
+    network = String(network ?? '').trim().toUpperCase();
+
+    if (!number || !network) return;
+
+    numberNetwork[number] = network;
+}
+
+/* =========================================
    VASTAAMATTOMAT PUHELUT
    ========================================= */
 
@@ -53,7 +83,8 @@ function addMissedCall(targetNumber, fromNumber) {
 
     if (targetSocketId) {
         io.to(targetSocketId).emit('missed_call', {
-            fromNumber: fromNumber
+            fromNumber: fromNumber,
+            network: networkOf(fromNumber)
         });
     }
 }
@@ -122,10 +153,37 @@ io.on('connection', (socket) => {
         if (missedCalls[number] && missedCalls[number].size > 0) {
             missedCalls[number].forEach((fromNumber) => {
                 socket.emit('missed_call', {
-                    fromNumber: fromNumber
+                    fromNumber: fromNumber,
+                    network: networkOf(fromNumber)
                 });
             });
         }
+    });
+
+    /* =========================================
+       VERKKOTYYPIN REKISTERÖINTI (ARP-puhelin)
+       ========================================= */
+
+    socket.on('register_network', (data) => {
+        if (!data || typeof data !== 'object') return;
+
+        const number =
+            String(
+                data.number ??
+                data.phoneNumber ??
+                numberOfSocket(socket) ??
+                ''
+            ).trim();
+
+        setNetwork(number, data.network);
+
+        socket.mobiraInfo = socket.mobiraInfo || {};
+        socket.mobiraInfo.network =
+            String(data.network ?? '').trim().toUpperCase() || null;
+
+        console.log(
+            `Numero ${number} verkko: ${socket.mobiraInfo.network}`
+        );
     });
 
     /* =========================================
@@ -210,6 +268,14 @@ io.on('connection', (socket) => {
             console.log(
                 `Soittaja ${fromNumber} sidottu sockettiin ${socket.id}`
             );
+        }
+
+        /*
+         * Soittaja voi kertoa verkkotyyppinsä (esim. ARP).
+         */
+
+        if (data.network) {
+            setNetwork(fromNumber, data.network);
         }
 
         /*
@@ -323,15 +389,17 @@ io.on('connection', (socket) => {
 
         /*
          * Lähetetään tuleva puhelu vastaanottajalle.
+         * Mukana soittajan verkkotyyppi (ARP / null).
          */
 
         io.to(targetSocketId).emit('incoming_call', {
             fromNumber: fromNumber,
-            channel: callChannel
+            channel: callChannel,
+            network: networkOf(fromNumber)
         });
 
         console.log(
-            `Puhelu ${fromNumber} -> ${targetNumber}, kanava: ${callChannel}`
+            `Puhelu ${fromNumber} -> ${targetNumber}, kanava: ${callChannel}, verkko: ${networkOf(fromNumber)}`
         );
     });
 
