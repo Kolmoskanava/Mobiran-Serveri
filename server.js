@@ -36,7 +36,7 @@ const inCallUsers = new Set();
 /*
  * numero -> verkkotyyppi, esim. '21028' -> 'ARP'.
  * Täyttyy, kun ARP-puhelin lähettää register_network- tai
- * start_call-viestin. Lisäksi kaikki 210xx-numerot (5 numeroa)
+ * start_call-viestin. Lisäksi kaikki 210-alkuiset numerot
  * tunnistetaan ARP-numeroiksi.
  */
 const numberNetwork = {};
@@ -45,7 +45,7 @@ function networkOf(number) {
     number = String(number ?? '');
 
     if (numberNetwork[number]) return numberNetwork[number];
-    if (/^210\d{2}$/.test(number)) return 'ARP';
+    if (/^210/.test(number)) return 'ARP';
 
     return null;
 }
