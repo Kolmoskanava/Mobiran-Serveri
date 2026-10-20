@@ -464,6 +464,13 @@ io.on('connection', (socket) => {
                     `Registration ID received from number ${targetNumber}`,
                     'ok'
                 );
+
+                /*
+                 * Puhelun lähetys alkaa tästä. Itse puhelu ei välity
+                 * vielä: se saapuu vastaanottajalle vasta, kun
+                 * lähetysvaihe on kestänyt oman aikansa.
+                 */
+                serverLog(`Sending call to ${targetNumber}`);
             }
         }, delay * 0.6));
 
@@ -542,8 +549,6 @@ io.on('connection', (socket) => {
                 channel: callChannel,
                 network: networkOf(fromNumber)
             });
-
-            serverLog(`Sending call to ${targetNumber}`);
 
             console.log(
                 `Puhelu ${fromNumber} -> ${targetNumber}, kanava: ${callChannel}, verkko: ${networkOf(fromNumber)}`
