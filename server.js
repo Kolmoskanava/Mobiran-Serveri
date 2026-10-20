@@ -92,6 +92,38 @@ function setNetwork(number, network) {
 }
 
 /* =========================================
+   VASTAANOTTAJAN TAVOITTAMISEN VIIVE (NMT)
+   ========================================= */
+
+/*
+ * Oikeassa NMT-verkossa vastaanottajan tavoittaminen kesti
+ * noin 3-10 sekuntia. Arvoja voi muuttaa Renderin
+ * ympäristömuuttujilla PAGING_MIN_MS ja PAGING_MAX_MS.
+ */
+const PAGING_MIN_MS = Number(process.env.PAGING_MIN_MS) || 3000;
+const PAGING_MAX_MS = Number(process.env.PAGING_MAX_MS) || 10000;
+
+function pagingDelay() {
+    return PAGING_MIN_MS + Math.random() * (PAGING_MAX_MS - PAGING_MIN_MS);
+}
+
+/*
+ * Puhelut, joiden vastaanottajaa vielä haetaan.
+ * pendingCalls['246927'] = { from, timers: [] }
+ */
+const pendingCalls = {};
+
+function cancelPending(targetNumber) {
+    const p = pendingCalls[targetNumber];
+    if (!p) return null;
+
+    p.timers.forEach(clearTimeout);
+    delete pendingCalls[targetNumber];
+
+    return p;
+}
+
+/* =========================================
    VASTAAMATTOMAT PUHELUT
    ========================================= */
 
@@ -320,6 +352,8 @@ io.on('connection', (socket) => {
        ========================================= */
 
     socket.on('start_call', (data) => {
+        data = data || {};
+
         const fromNumber =
             String(data.fromNumber || '');
 
@@ -383,13 +417,6 @@ io.on('connection', (socket) => {
         clearMissedCall(fromNumber, targetNumber);
 
         /*
-         * Etsitään vastaanottajan socket.
-         */
-
-        const targetSocketId =
-            activeUsers[targetNumber];
-
-        /*
          * Jos jompikumpi on jo puhelussa,
          * ilmoitetaan oikeasta varatusta linjasta.
          */
@@ -414,114 +441,111 @@ io.on('connection', (socket) => {
         }
 
         /*
-         * Vastaanottajan puhelin ei ole verkossa.
-         *
-         * Ei lähetetä line_busy-tapahtumaa.
-         * Näin asiakas ei käsittele tilannetta
-         * varattuna linjana.
+         * Merkitään osapuolet varatuiksi heti, jotta kolmas
+         * soittaja saa varattuäänen hakuvaiheessakin.
          */
-
-        if (!targetSocketId) {
-            console.log(
-                `Kohdetta ${targetNumber} ei ole rekisteröity. ` +
-                `Verkossa: [${Object.keys(activeUsers).join(', ')}]`
-            );
-
-            serverLog(
-                `Number ${targetNumber} is not registered - call failed`,
-                'err'
-            );
-
-            addMissedCall(targetNumber, fromNumber);
-
-            socket.emit('number_unavailable', {
-                targetNumber,
-                reason: 'offline'
-            });
-
-            return;
-        }
-
-        /* =====================================
-           KANAVAN KÄSITTELY
-           ===================================== */
-
-        let callChannel =
-            data.channel ?? null;
-
-        /*
-         * Cityman käyttää vastaanottajan kanavaa.
-         */
-
-        if (
-            data.cityman === true ||
-            data.deviceType === 'CITYMAN'
-        ) {
-            const targetSocket =
-                io.sockets.sockets.get(targetSocketId);
-
-            if (
-                targetSocket &&
-                targetSocket.mobiraInfo &&
-                targetSocket.mobiraInfo.currentChannel != null
-            ) {
-                callChannel =
-                    targetSocket.mobiraInfo.currentChannel;
-            }
-        }
-
-        /* =====================================
-           MERKITÄÄN PUHELUN OSAPUOLET
-           ===================================== */
-
         inCallUsers.add(fromNumber);
         inCallUsers.add(targetNumber);
 
-        /*
-         * Merkitään puhelu soimaan.
-         */
-
-        ringingCalls[targetNumber] = fromNumber;
-
-        /*
-         * Tallennetaan puhelun tiedot lokia varten.
-         */
-
-        callInfo[targetNumber] = {
-            from: fromNumber,
-            channel: callChannel,
-            network: callNetwork,
-            established: false
-        };
-
-        /*
-         * Vahvistetaan soittajalle, että kohde
-         * on verkossa ja puheluyritys voi alkaa.
-         *
-         * Asiakkaan pitää käynnistää dial tone
-         * vasta saatuaan tämän tapahtuman.
-         */
-
-        socket.emit('call_ringing', {
-            targetNumber: targetNumber
-        });
-
-        /*
-         * Lähetetään tuleva puhelu vastaanottajalle.
-         * Mukana soittajan verkkotyyppi (ARP / null).
-         */
-
-        io.to(targetSocketId).emit('incoming_call', {
-            fromNumber: fromNumber,
-            channel: callChannel,
-            network: networkOf(fromNumber)
-        });
-
-        serverLog(`Sending call to ${targetNumber}`);
+        const delay = pagingDelay();
+        const pending = { from: fromNumber, timers: [] };
+        pendingCalls[targetNumber] = pending;
 
         console.log(
-            `Puhelu ${fromNumber} -> ${targetNumber}, kanava: ${callChannel}, verkko: ${networkOf(fromNumber)}`
+            `Haetaan ${targetNumber} (${fromNumber} soittaa), viive ${Math.round(delay)} ms`
         );
+
+        /*
+         * Välivaihe: vastaanottajan puhelin "vastaa" rekisteröintikyselyyn.
+         */
+        pending.timers.push(setTimeout(() => {
+            if (activeUsers[targetNumber]) {
+                serverLog(
+                    `Registration ID received from number ${targetNumber}`,
+                    'ok'
+                );
+            }
+        }, delay * 0.6));
+
+        /*
+         * Viive päättyy: joko vastaanottaja löytyi tai ei.
+         */
+        pending.timers.push(setTimeout(() => {
+            delete pendingCalls[targetNumber];
+
+            const callerSocketId = activeUsers[fromNumber];
+            const targetSocketId = activeUsers[targetNumber];
+
+            /* Vastaanottajaa ei löytynyt */
+            if (!targetSocketId) {
+                console.log(
+                    `Kohdetta ${targetNumber} ei löytynyt. ` +
+                    `Verkossa: [${Object.keys(activeUsers).join(', ')}]`
+                );
+
+                serverLog(
+                    `Number ${targetNumber} is not registered - call failed`,
+                    'err'
+                );
+
+                inCallUsers.delete(fromNumber);
+                inCallUsers.delete(targetNumber);
+
+                addMissedCall(targetNumber, fromNumber);
+
+                if (callerSocketId) {
+                    io.to(callerSocketId).emit('number_unavailable', {
+                        targetNumber,
+                        reason: 'offline'
+                    });
+                }
+
+                return;
+            }
+
+            /* Kanavan käsittely (Cityman käyttää vastaanottajan kanavaa) */
+            let callChannel = data.channel ?? null;
+
+            if (data.cityman === true || data.deviceType === 'CITYMAN') {
+                const targetSocket = io.sockets.sockets.get(targetSocketId);
+
+                if (
+                    targetSocket &&
+                    targetSocket.mobiraInfo &&
+                    targetSocket.mobiraInfo.currentChannel != null
+                ) {
+                    callChannel = targetSocket.mobiraInfo.currentChannel;
+                }
+            }
+
+            ringingCalls[targetNumber] = fromNumber;
+
+            callInfo[targetNumber] = {
+                from: fromNumber,
+                channel: callChannel,
+                network: callNetwork,
+                established: false
+            };
+
+            /* Soittaja kuulee dial tonen vasta nyt, kun kohde on tavoitettu */
+            if (callerSocketId) {
+                io.to(callerSocketId).emit('call_ringing', {
+                    targetNumber: targetNumber
+                });
+            }
+
+            io.to(targetSocketId).emit('incoming_call', {
+                fromNumber: fromNumber,
+                channel: callChannel,
+                network: networkOf(fromNumber)
+            });
+
+            serverLog(`Sending call to ${targetNumber}`);
+
+            console.log(
+                `Puhelu ${fromNumber} -> ${targetNumber}, kanava: ${callChannel}, verkko: ${networkOf(fromNumber)}`
+            );
+        }, delay));
     });
 
     /* =========================================
@@ -573,7 +597,7 @@ io.on('connection', (socket) => {
          */
 
         const callerSocketId =
-            activeUsers[data.targetNumber];
+            data && activeUsers[data.targetNumber];
 
         if (callerSocketId) {
             io.to(callerSocketId).emit('call_answered', {
@@ -591,7 +615,7 @@ io.on('connection', (socket) => {
 
     socket.on('webrtc_offer', (data) => {
         const targetSocketId =
-            activeUsers[data.targetNumber];
+            data && activeUsers[data.targetNumber];
 
         if (targetSocketId) {
             io.to(targetSocketId).emit('webrtc_offer', {
@@ -607,7 +631,7 @@ io.on('connection', (socket) => {
 
     socket.on('webrtc_answer', (data) => {
         const targetSocketId =
-            activeUsers[data.targetNumber];
+            data && activeUsers[data.targetNumber];
 
         if (targetSocketId) {
             io.to(targetSocketId).emit('webrtc_answer', {
@@ -641,7 +665,7 @@ io.on('connection', (socket) => {
 
     socket.on('webrtc_ice_candidate', (data) => {
         const targetSocketId =
-            activeUsers[data.targetNumber];
+            data && activeUsers[data.targetNumber];
 
         if (targetSocketId) {
             io.to(targetSocketId).emit(
@@ -669,6 +693,28 @@ io.on('connection', (socket) => {
             data && data.targetNumber
                 ? String(data.targetNumber)
                 : null;
+
+        /*
+         * Soittaja lopetti ennen kuin vastaanottaja oli tavoitettu:
+         * perutaan haku. Vastaanottajan puhelin ei ehtinyt soida,
+         * joten vastaamatonta puhelua ei merkitä.
+         */
+        if (
+            thisNumber && targetForLog &&
+            pendingCalls[targetForLog] &&
+            pendingCalls[targetForLog].from === thisNumber
+        ) {
+            cancelPending(targetForLog);
+            inCallUsers.delete(thisNumber);
+            inCallUsers.delete(targetForLog);
+
+            serverLog(
+                `Call cancelled before recipient was reached (${thisNumber} -> ${targetForLog})`,
+                'warn'
+            );
+
+            return;
+        }
 
         const wasActive =
             (thisNumber && inCallUsers.has(thisNumber)) ||
@@ -739,6 +785,26 @@ io.on('connection', (socket) => {
 
                 inCallUsers.delete(number);
                 delete callInfo[number];
+
+                /* Vastaanottaja katosi kesken haun */
+                if (pendingCalls[number]) {
+                    const p = cancelPending(number);
+                    inCallUsers.delete(p.from);
+                    addMissedCall(number, p.from);
+
+                    const pendingCallerSocketId = activeUsers[p.from];
+                    if (pendingCallerSocketId) {
+                        io.to(pendingCallerSocketId).emit('call_ended');
+                    }
+                }
+
+                /* Soittaja katosi kesken haun */
+                for (const [target, p] of Object.entries(pendingCalls)) {
+                    if (p.from === number) {
+                        cancelPending(target);
+                        inCallUsers.delete(target);
+                    }
+                }
 
                 /*
                  * Jos laite poistuu verkosta puhelun
