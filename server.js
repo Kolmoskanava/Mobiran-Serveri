@@ -30,6 +30,38 @@ const activeUsers = {};
 const inCallUsers = new Set();
 
 /* =========================================
+   SERVERILOKI (Serverilogi.html kuuntelee tätä)
+   ========================================= */
+
+/*
+ * Jos asetat Renderissä ympäristömuuttujan MONITOR_KEY,
+ * lokia voi katsoa vain se, joka tietää avaimen.
+ */
+const MONITOR_KEY = process.env.MONITOR_KEY || '';
+
+/* Viimeiset 300 riviä uusille lokikatselijoille. */
+const logBuffer = [];
+
+/*
+ * Käynnissä olevan puhelun tiedot, avaimena vastaanottajan numero:
+ * callInfo['246927'] = { from, channel, network, established }
+ */
+const callInfo = {};
+
+function serverLog(msg, kind) {
+    const entry = {
+        ts: Date.now(),
+        msg: String(msg),
+        kind: kind || 'info'
+    };
+
+    logBuffer.push(entry);
+    if (logBuffer.length > 300) logBuffer.shift();
+
+    io.to('monitors').emit('server_log', entry);
+}
+
+/* =========================================
    VERKKOTYYPPI (ARP / NMT)
    ========================================= */
 
@@ -77,6 +109,11 @@ function addMissedCall(targetNumber, fromNumber) {
 
     console.log(
         `Vastaamaton puhelu merkitty: ${fromNumber} -> ${targetNumber}`
+    );
+
+    serverLog(
+        `Missed call: ${fromNumber} -> ${targetNumber}`,
+        'warn'
     );
 
     const targetSocketId = activeUsers[targetNumber];
@@ -132,6 +169,27 @@ function numberOfSocket(socket) {
 io.on('connection', (socket) => {
 
     /* =========================================
+       LOKIKATSELIJA (Serverilogi.html)
+       ========================================= */
+
+    socket.on('monitor_subscribe', (key, ack) => {
+        if (MONITOR_KEY && key !== MONITOR_KEY) {
+            if (typeof ack === 'function') ack({ ok: false });
+            return;
+        }
+
+        /*
+         * Lokikatselija ei ole puhelin: se ei rekisteröi numeroa,
+         * joten se ei vaikuta puheluihin eikä näy puhelimena.
+         */
+        socket.join('monitors');
+
+        if (typeof ack === 'function') {
+            ack({ ok: true, history: logBuffer });
+        }
+    });
+
+    /* =========================================
        NUMERON REKISTERÖINTI
        ========================================= */
 
@@ -149,6 +207,8 @@ io.on('connection', (socket) => {
         console.log(
             `Numero ${number} rekisteröity socketiin ${socket.id}`
         );
+
+        serverLog(`Phone ${number} registered`);
 
         if (missedCalls[number] && missedCalls[number].size > 0) {
             missedCalls[number].forEach((fromNumber) => {
@@ -184,6 +244,10 @@ io.on('connection', (socket) => {
         console.log(
             `Numero ${number} verkko: ${socket.mobiraInfo.network}`
         );
+
+        serverLog(
+            `Phone ${number} announced network: ${socket.mobiraInfo.network}`
+        );
     });
 
     /* =========================================
@@ -199,6 +263,8 @@ io.on('connection', (socket) => {
             console.log(
                 `Vastaamattomat puhelut nollattu: ${n}`
             );
+
+            serverLog(`Missed calls cleared by ${n}`);
         }
     });
 
@@ -266,6 +332,11 @@ io.on('connection', (socket) => {
          */
 
         if (!fromNumber || !targetNumber) {
+            serverLog(
+                'Invalid call signal (missing number)',
+                'err'
+            );
+
             socket.emit('number_unavailable', {
                 targetNumber,
                 reason: 'invalid_number'
@@ -295,6 +366,17 @@ io.on('connection', (socket) => {
         }
 
         /*
+         * Loki: puhelusignaali saapui, verkko tunnistettiin
+         * ja kohdenumeron rekisteröintiä kysytään.
+         */
+
+        const callNetwork = networkOf(fromNumber) || 'NMT';
+
+        serverLog(`Incoming call signal from ${fromNumber}`);
+        serverLog(`Phone's network identified: ${callNetwork}`);
+        serverLog(`Asking for Registration ID from number ${targetNumber}`);
+
+        /*
          * Takaisinsoitto kuittaa vastaamattoman puhelun.
          */
 
@@ -321,6 +403,11 @@ io.on('connection', (socket) => {
                 `Puhelussa: [${[...inCallUsers].join(', ')}]`
             );
 
+            serverLog(
+                `Line busy: ${fromNumber} -> ${targetNumber}`,
+                'err'
+            );
+
             socket.emit('line_busy');
 
             return;
@@ -338,6 +425,11 @@ io.on('connection', (socket) => {
             console.log(
                 `Kohdetta ${targetNumber} ei ole rekisteröity. ` +
                 `Verkossa: [${Object.keys(activeUsers).join(', ')}]`
+            );
+
+            serverLog(
+                `Number ${targetNumber} is not registered - call failed`,
+                'err'
             );
 
             addMissedCall(targetNumber, fromNumber);
@@ -392,6 +484,17 @@ io.on('connection', (socket) => {
         ringingCalls[targetNumber] = fromNumber;
 
         /*
+         * Tallennetaan puhelun tiedot lokia varten.
+         */
+
+        callInfo[targetNumber] = {
+            from: fromNumber,
+            channel: callChannel,
+            network: callNetwork,
+            established: false
+        };
+
+        /*
          * Vahvistetaan soittajalle, että kohde
          * on verkossa ja puheluyritys voi alkaa.
          *
@@ -414,6 +517,8 @@ io.on('connection', (socket) => {
             network: networkOf(fromNumber)
         });
 
+        serverLog(`Sending call to ${targetNumber}`);
+
         console.log(
             `Puhelu ${fromNumber} -> ${targetNumber}, kanava: ${callChannel}, verkko: ${networkOf(fromNumber)}`
         );
@@ -435,6 +540,21 @@ io.on('connection', (socket) => {
             ringingCalls[answeringNumber]
         ) {
             delete ringingCalls[answeringNumber];
+        }
+
+        /*
+         * Loki: vastaus ja yhteyden muodostus alkaa.
+         */
+
+        if (answeringNumber) {
+            const info = callInfo[answeringNumber];
+
+            serverLog(`Call picked up (${answeringNumber})`);
+            serverLog(
+                `Establishing connection - Network type: ${
+                    info ? info.network : (networkOf(data && data.targetNumber) || 'NMT')
+                }`
+            );
         }
 
         /*
@@ -494,6 +614,25 @@ io.on('connection', (socket) => {
                 answer: data.answer
             });
         }
+
+        /*
+         * Loki: vastaaja lähetti WebRTC-vastauksen -> yhteys muodostettu.
+         * Lokiin vain kerran per puhelu.
+         */
+
+        const answeringNumber = numberOfSocket(socket);
+        const info = answeringNumber && callInfo[answeringNumber];
+
+        if (info && !info.established) {
+            info.established = true;
+
+            serverLog(
+                `Connection established on channel ${
+                    info.channel != null ? info.channel : 'unknown'
+                }`,
+                'ok'
+            );
+        }
     });
 
     /* =========================================
@@ -521,8 +660,30 @@ io.on('connection', (socket) => {
     socket.on('end_call', (data) => {
         const thisNumber = numberOfSocket(socket);
 
+        /*
+         * Loki: kirjataan lopetus vain kerran, vaikka
+         * molemmat osapuolet lähettävät end_call.
+         */
+
+        const targetForLog =
+            data && data.targetNumber
+                ? String(data.targetNumber)
+                : null;
+
+        const wasActive =
+            (thisNumber && inCallUsers.has(thisNumber)) ||
+            (targetForLog && inCallUsers.has(targetForLog));
+
+        if (wasActive && thisNumber && targetForLog) {
+            serverLog(
+                `Call ended (${thisNumber} -> ${targetForLog})`,
+                'warn'
+            );
+        }
+
         if (thisNumber) {
             inCallUsers.delete(thisNumber);
+            delete callInfo[thisNumber];
         }
 
         if (data && data.targetNumber) {
@@ -530,6 +691,7 @@ io.on('connection', (socket) => {
                 String(data.targetNumber);
 
             inCallUsers.delete(targetNumber);
+            delete callInfo[targetNumber];
 
             /*
              * Jos vastaanottaja ei ehtinyt vastata,
@@ -576,6 +738,7 @@ io.on('connection', (socket) => {
                 delete activeUsers[number];
 
                 inCallUsers.delete(number);
+                delete callInfo[number];
 
                 /*
                  * Jos laite poistuu verkosta puhelun
@@ -608,6 +771,11 @@ io.on('connection', (socket) => {
 
                 console.log(
                     `Numero ${number} poistui verkosta`
+                );
+
+                serverLog(
+                    `Phone ${number} disconnected`,
+                    'warn'
                 );
 
                 break;
