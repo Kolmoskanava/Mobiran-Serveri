@@ -498,6 +498,9 @@ io.on('connection', (socket) => {
                         targetNumber,
                         reason: 'offline'
                     });
+
+                    /* Katkaistaan puhelu soittajan päässä */
+                    io.to(callerSocketId).emit('call_ended');
                 }
 
                 return;
@@ -781,10 +784,50 @@ io.on('connection', (socket) => {
             of Object.entries(activeUsers)
         ) {
             if (id === socket.id) {
+                /*
+                 * Puhelin sammui tai katkesi verkosta kesken puhelun:
+                 * katkaistaan puhelu toiselta osapuolelta.
+                 */
+                let peer = null;
+
+                if (callInfo[number]) {
+                    peer = callInfo[number].from;
+                } else {
+                    for (const [t, info] of Object.entries(callInfo)) {
+                        if (info.from === number) {
+                            peer = t;
+                            break;
+                        }
+                    }
+                }
+
                 delete activeUsers[number];
 
                 inCallUsers.delete(number);
                 delete callInfo[number];
+
+                if (peer) {
+                    inCallUsers.delete(peer);
+                    delete callInfo[peer];
+
+                    /* Soiva puhelu käsitellään alempana erikseen */
+                    if (ringingCalls[number] !== peer) {
+                        if (ringingCalls[peer] === number) {
+                            addMissedCall(peer, number);
+                            delete ringingCalls[peer];
+                        }
+
+                        const peerSocketId = activeUsers[peer];
+                        if (peerSocketId) {
+                            io.to(peerSocketId).emit('call_ended');
+                        }
+
+                        serverLog(
+                            `Call ended - ${number} went offline (${number} <-> ${peer})`,
+                            'warn'
+                        );
+                    }
+                }
 
                 /* Vastaanottaja katosi kesken haun */
                 if (pendingCalls[number]) {
