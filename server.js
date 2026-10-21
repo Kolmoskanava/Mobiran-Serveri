@@ -198,6 +198,90 @@ function numberOfSocket(socket) {
     return null;
 }
 
+/* =========================================
+   TESTISOITTO
+   ========================================= */
+
+const TEST_FROM_DEFAULT = process.env.TEST_CALL_FROM || '000000';
+const TEST_RING_MS = Number(process.env.TEST_CALL_RING_MS) || 30000;
+const TEST_MAX_AHEAD_MS = 24 * 60 * 60 * 1000;   /* max 24 h eteenpäin */
+const MAX_SCHEDULED_TESTS = 20;
+const scheduledTests = new Set();
+
+/*
+ * Palvelin soittaa vastaanottajalle itse. Soittajaa ei ole oikeaa
+ * puhelinta, joten kukaan ei kuule dial tonea: call_ringing-viestiä
+ * ei lähetetä kenellekään, vain vastaanottaja saa incoming_call.
+ */
+function runTestCall(fromNumber, targetNumber) {
+    const targetSocketId = activeUsers[targetNumber];
+
+    serverLog(`Test call: incoming call signal from ${fromNumber}`);
+    serverLog(`Asking for Registration ID from number ${targetNumber}`);
+
+    if (!targetSocketId) {
+        serverLog(
+            `Number ${targetNumber} is not registered - test call failed`,
+            'err'
+        );
+        return;
+    }
+
+    if (inCallUsers.has(targetNumber) || inCallUsers.has(fromNumber)) {
+        serverLog(
+            `Line busy: ${fromNumber} -> ${targetNumber} (test call)`,
+            'err'
+        );
+        return;
+    }
+
+    inCallUsers.add(fromNumber);
+    inCallUsers.add(targetNumber);
+
+    ringingCalls[targetNumber] = fromNumber;
+
+    callInfo[targetNumber] = {
+        from: fromNumber,
+        channel: null,
+        network: networkOf(fromNumber) || 'NMT',
+        established: false
+    };
+
+    serverLog(`Sending call to ${targetNumber}`);
+
+    io.to(targetSocketId).emit('incoming_call', {
+        fromNumber: fromNumber,
+        channel: null,
+        network: networkOf(fromNumber),
+        testCall: true
+    });
+
+    /* Ei vastausta ajassa -> vastaamaton puhelu */
+    setTimeout(() => {
+        if (ringingCalls[targetNumber] !== fromNumber) return;
+
+        delete ringingCalls[targetNumber];
+
+        if (inCallUsers.has(targetNumber)) {
+            inCallUsers.delete(targetNumber);
+            inCallUsers.delete(fromNumber);
+            delete callInfo[targetNumber];
+
+            addMissedCall(targetNumber, fromNumber);
+
+            const id = activeUsers[targetNumber];
+            if (id) io.to(id).emit('call_ended');
+
+            serverLog(
+                `Test call not answered (${fromNumber} -> ${targetNumber})`,
+                'warn'
+            );
+        } else {
+            inCallUsers.delete(fromNumber);
+        }
+    }, TEST_RING_MS);
+}
+
 io.on('connection', (socket) => {
 
     /* =========================================
@@ -219,6 +303,55 @@ io.on('connection', (socket) => {
         if (typeof ack === 'function') {
             ack({ ok: true, history: logBuffer });
         }
+    });
+
+    /* =========================================
+       TESTISOITTO (Serverilogi.html)
+       ========================================= */
+
+    socket.on('test_call', (data, ack) => {
+        const reply = (r) => { if (typeof ack === 'function') ack(r); };
+
+        data = data || {};
+
+        if (MONITOR_KEY && data.key !== MONITOR_KEY) {
+            return reply({ ok: false, error: 'Väärä lokiavain' });
+        }
+
+        const number = String(data.number ?? '').trim();
+        const from = String(data.fromNumber || TEST_FROM_DEFAULT).trim();
+
+        if (!/^\+?\d{3,15}$/.test(number)) {
+            return reply({ ok: false, error: 'Virheellinen numero' });
+        }
+        if (!/^\+?\d{3,15}$/.test(from)) {
+            return reply({ ok: false, error: 'Virheellinen soittajan numero' });
+        }
+        if (scheduledTests.size >= MAX_SCHEDULED_TESTS) {
+            return reply({ ok: false, error: 'Liikaa ajastettuja testisoittoja' });
+        }
+
+        const runAt = Number(data.runAt) || Date.now();
+        const delay = Math.max(0, runAt - Date.now());
+
+        if (delay > TEST_MAX_AHEAD_MS) {
+            return reply({ ok: false, error: 'Aika on yli 24 h päässä' });
+        }
+
+        const handle = {};
+        scheduledTests.add(handle);
+
+        handle.timer = setTimeout(() => {
+            scheduledTests.delete(handle);
+            runTestCall(from, number);
+        }, delay);
+
+        serverLog(
+            `Test call scheduled: ${from} -> ${number} in ${Math.round(delay / 1000)} s`,
+            'sys'
+        );
+
+        reply({ ok: true });
     });
 
     /* =========================================
