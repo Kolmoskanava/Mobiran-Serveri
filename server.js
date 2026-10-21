@@ -203,7 +203,11 @@ function numberOfSocket(socket) {
    ========================================= */
 
 const TEST_FROM_DEFAULT = process.env.TEST_CALL_FROM || '000000';
-const TEST_RING_MS = Number(process.env.TEST_CALL_RING_MS) || 30000;
+/*
+ * Testisoiton soittoaika. 0 = soi, kunnes vastataan (ei aikarajaa).
+ * Voit asettaa aikarajan ympäristömuuttujalla TEST_CALL_RING_MS.
+ */
+const TEST_RING_MS = Number(process.env.TEST_CALL_RING_MS) || 0;
 const TEST_MAX_AHEAD_MS = 24 * 60 * 60 * 1000;   /* max 24 h eteenpäin */
 const MAX_SCHEDULED_TESTS = 20;
 const scheduledTests = new Set();
@@ -256,8 +260,12 @@ function runTestCall(fromNumber, targetNumber) {
         testCall: true
     });
 
-    /* Ei vastausta ajassa -> vastaamaton puhelu */
-    setTimeout(() => {
+    /*
+     * Ei vastausta ajassa -> vastaamaton puhelu.
+     * Ajastin käynnistetään vain, jos aikaraja on asetettu (TEST_RING_MS > 0).
+     * Oletuksena testisoitto soi, kunnes vastataan.
+     */
+    if (TEST_RING_MS > 0) setTimeout(() => {
         if (ringingCalls[targetNumber] !== fromNumber) return;
 
         delete ringingCalls[targetNumber];
@@ -709,12 +717,19 @@ io.on('connection', (socket) => {
 
         /*
          * Loki: vastaus ja yhteyden muodostus alkaa.
+         * Rivillä on soittaja ja vastaaja, jotta Serverilogi
+         * tunnistaa puhelun alkavan (soittaja -> vastaaja).
          */
 
         if (answeringNumber) {
             const info = callInfo[answeringNumber];
+            const callerNum = info
+                ? info.from
+                : (data && data.targetNumber ? String(data.targetNumber) : null);
 
-            serverLog(`Call picked up (${answeringNumber})`);
+            serverLog(
+                `Call picked up (${callerNum ? callerNum + ' -> ' : ''}${answeringNumber})`
+            );
             serverLog(
                 `Establishing connection - Network type: ${
                     info ? info.network : (networkOf(data && data.targetNumber) || 'NMT')
