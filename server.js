@@ -130,6 +130,24 @@ function cancelPending(targetNumber) {
 const missedCalls = {};
 const ringingCalls = {};
 
+// Tekstiviestit: tuki on oletuksena pois päältä. Puhelimen on ilmoitettava
+// supportsSms: true register_device-tapahtumassa ennen SMS:n käyttöä.
+const smsMailboxes = Object.create(null);
+const smsCapableNumbers = new Set();
+const MAX_SMS_PER_MAILBOX = 100;
+
+function socketSupportsSms(socketId) {
+    const s = io.sockets.sockets.get(socketId);
+    return !!(s && s.mobiraInfo && s.mobiraInfo.supportsSms === true);
+}
+
+function deliverQueuedSms(number, socketId) {
+    if (!socketSupportsSms(socketId)) return;
+    const box = smsMailboxes[number];
+    if (!box || !box.length) return;
+    box.splice(0).forEach((message) => io.to(socketId).emit('incoming_sms', message));
+}
+
 function addMissedCall(targetNumber, fromNumber) {
     if (!targetNumber || !fromNumber) return;
 
@@ -451,8 +469,10 @@ io.on('connection', (socket) => {
 
             deviceType:
                 data && data.deviceType
-                    ? data.deviceType
-                    : null,
+                    ? String(data.deviceType).toUpperCase()
+                    : (socket.mobiraInfo && socket.mobiraInfo.deviceType) || null,
+
+            supportsSms: !!(data && data.supportsSms === true),
 
             hiddenChannel:
                 !!(
@@ -464,8 +484,14 @@ io.on('connection', (socket) => {
                 data &&
                 data.currentChannel != null
                     ? data.currentChannel
-                    : null
+                    : (socket.mobiraInfo && socket.mobiraInfo.currentChannel != null
+                        ? socket.mobiraInfo.currentChannel
+                        : null)
         };
+
+        const registeredNumber = numberOfSocket(socket);
+        if (registeredNumber && socket.mobiraInfo.supportsSms) smsCapableNumbers.add(registeredNumber);
+        if (registeredNumber) deliverQueuedSms(registeredNumber, socket.id);
 
         console.log(
             'Laite rekisteröity:',
@@ -925,6 +951,64 @@ io.on('connection', (socket) => {
                 io.to(targetSocketId).emit('call_ended');
             }
         }
+    });
+
+    /* =========================================
+       TEKSTIVIESTIT (SMS)
+       ========================================= */
+
+    socket.on('send_sms', (data, ack) => {
+        const reply = (result) => {
+            if (typeof ack === 'function') ack(result);
+        };
+        data = data || {};
+
+        const fromNumber = numberOfSocket(socket);
+        const toNumber = String(data.toNumber || '').trim();
+        const text = String(data.text || '').trim();
+
+        if (!fromNumber) return reply({ ok: false, error: 'Lähettäjän numeroa ei ole rekisteröity' });
+        if (!socketSupportsSms(socket.id)) {
+            serverLog(`SMS blocked: ${fromNumber} does not support SMS`, 'warn');
+            return reply({ ok: false, error: 'Tämä puhelin ei tue tekstiviestejä' });
+        }
+        if (!/^\\+?\\d{3,15}$/.test(toNumber)) {
+            return reply({ ok: false, error: 'Virheellinen vastaanottajan numero' });
+        }
+        if (!text) return reply({ ok: false, error: 'Viesti on tyhjä' });
+        if (text.length > 500) return reply({ ok: false, error: 'Viesti on liian pitkä (enintään 500 merkkiä)' });
+
+        const targetSocketId = activeUsers[toNumber];
+        if (targetSocketId && !socketSupportsSms(targetSocketId)) {
+            serverLog(`SMS blocked: recipient ${toNumber} does not support SMS`, 'warn');
+            return reply({ ok: false, error: 'Vastaanottajan puhelin ei tue tekstiviestejä' });
+        }
+
+        const message = {
+            fromNumber,
+            toNumber,
+            text,
+            timestamp: Date.now()
+        };
+
+        if (targetSocketId && socketSupportsSms(targetSocketId)) {
+            io.to(targetSocketId).emit('incoming_sms', message);
+            serverLog(`SMS delivered: ${fromNumber} -> ${toNumber}`);
+            return reply({ ok: true, delivered: true });
+        }
+
+        // Vastaanottaja ei ole verkossa: jonotetaan vain, jos numero tunnetaan
+        // aiemmasta rekisteröinnistä ja sen puhelin on ilmoittanut SMS-tuen.
+        const targetWasSmsCapable = smsCapableNumbers.has(toNumber);
+        if (!targetWasSmsCapable) {
+            return reply({ ok: false, error: 'Vastaanottajan numeroa ei löydy tai tekstiviestituki ei ole tiedossa' });
+        }
+
+        if (!smsMailboxes[toNumber]) smsMailboxes[toNumber] = [];
+        if (smsMailboxes[toNumber].length >= MAX_SMS_PER_MAILBOX) smsMailboxes[toNumber].shift();
+        smsMailboxes[toNumber].push(message);
+        serverLog(`SMS queued: ${fromNumber} -> ${toNumber}`, 'warn');
+        return reply({ ok: true, delivered: false, queued: true });
     });
 
     /* =========================================
