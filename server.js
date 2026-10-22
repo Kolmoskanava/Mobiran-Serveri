@@ -210,14 +210,35 @@ function clearMissedCall(numberThatMissed, fromNumber) {
  * Soitto numeroon, joka ei ole koskaan rekisteröitynyt -> reason: 'not_registered'
  *   (puhelin: "Valitsemanne numero ei ole käytössä")
  *
- * Lista tallennetaan tiedostoon. HUOM: Renderin ilmainen taso nollaa levyn
- * herätessä/päivityksessä, joten pysyvyyttä varten lisää numerot
- * ympäristömuuttujaan KNOWN_NUMBERS (pilkulla eroteltu, esim. "940882,246927")
- * tai käytä Renderin Persistent Diskiä ja aseta KNOWN_NUMBERS_FILE sen polkuun.
+ * Numerot tallennetaan pysyvästi Upstash Redis -tietokantaan, jos Renderissä on
+ * ympäristömuuttujat UPSTASH_REDIS_REST_URL ja UPSTASH_REDIS_REST_TOKEN.
+ * Tietokanta säilyy Renderin uudelleenkäynnistyksissä, joten numeroita ei
+ * tarvitse ylläpitää käsin.
+ *
+ * Varalla toimivat edelleen tiedosto (Renderin ilmainen taso nollaa levyn)
+ * ja ympäristömuuttuja KNOWN_NUMBERS (pilkulla eroteltu, esim. "940882,246927").
+ * Vaatii Node 18+ (fetch on mukana).
  */
 const KNOWN_NUMBERS_FILE =
     process.env.KNOWN_NUMBERS_FILE || path.join(__dirname, 'known-numbers.json');
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || '';
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const REDIS_KEY = 'mobira:known_numbers';
 const knownNumbers = new Set();
+
+async function redisCommand(args) {
+    const res = await fetch(REDIS_URL, {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${REDIS_TOKEN}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(args)
+    });
+    const json = await res.json();
+    if (json.error) throw new Error(json.error);
+    return json.result;
+}
 
 (function loadKnownNumbers() {
     try {
@@ -230,6 +251,15 @@ const knownNumbers = new Set();
         .map((n) => n.trim())
         .filter(Boolean)
         .forEach((n) => knownNumbers.add(n));
+
+    if (REDIS_URL && REDIS_TOKEN) {
+        redisCommand(['SMEMBERS', REDIS_KEY])
+            .then((list) => {
+                (list || []).forEach((n) => knownNumbers.add(String(n)));
+                console.log(`Tunnettuja numeroita ladattu tietokannasta: ${(list || []).length}`);
+            })
+            .catch((e) => console.log('Tunnettujen numeroiden lataus epäonnistui:', e.message));
+    }
 })();
 
 function rememberNumber(number) {
@@ -242,6 +272,11 @@ function rememberNumber(number) {
         fs.writeFileSync(KNOWN_NUMBERS_FILE, JSON.stringify([...knownNumbers]));
     } catch (e) {
         console.log('Tunnettujen numeroiden tallennus epäonnistui:', e.message);
+    }
+
+    if (REDIS_URL && REDIS_TOKEN) {
+        redisCommand(['SADD', REDIS_KEY, number])
+            .catch((e) => console.log('Numeron tallennus tietokantaan epäonnistui:', e.message));
     }
 }
 
@@ -1026,7 +1061,7 @@ io.on('connection', (socket) => {
             serverLog(`SMS blocked: ${fromNumber} does not support SMS`, 'warn');
             return reply({ ok: false, error: 'Tämä puhelin ei tue tekstiviestejä' });
         }
-        if (!/^\\+?\\d{3,15}$/.test(toNumber)) {
+        if (!/^\+?\d{3,15}$/.test(toNumber)) {
             return reply({ ok: false, error: 'Virheellinen vastaanottajan numero' });
         }
         if (!text) return reply({ ok: false, error: 'Viesti on tyhjä' });
