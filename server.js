@@ -2,6 +2,8 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -197,8 +199,55 @@ function clearMissedCall(numberThatMissed, fromNumber) {
    APUFUNKTIOT
    ========================================= */
 
+/* =========================================
+   TUNNETUT NUMEROT (onko numero koskaan rekisteröitynyt)
+   ========================================= */
+
+/*
+ * Numero, joka on joskus rekisteröitynyt verkkoon, on "tunnettu".
+ * Soitto tunnettuun mutta nyt poissa olevaan numeroon -> reason: 'offline'
+ *   (puhelin: "Tavoittelemanne henkilö ei ole saatavilla")
+ * Soitto numeroon, joka ei ole koskaan rekisteröitynyt -> reason: 'not_registered'
+ *   (puhelin: "Valitsemanne numero ei ole käytössä")
+ *
+ * Lista tallennetaan tiedostoon. HUOM: Renderin ilmainen taso nollaa levyn
+ * herätessä/päivityksessä, joten pysyvyyttä varten lisää numerot
+ * ympäristömuuttujaan KNOWN_NUMBERS (pilkulla eroteltu, esim. "940882,246927")
+ * tai käytä Renderin Persistent Diskiä ja aseta KNOWN_NUMBERS_FILE sen polkuun.
+ */
+const KNOWN_NUMBERS_FILE =
+    process.env.KNOWN_NUMBERS_FILE || path.join(__dirname, 'known-numbers.json');
+const knownNumbers = new Set();
+
+(function loadKnownNumbers() {
+    try {
+        const list = JSON.parse(fs.readFileSync(KNOWN_NUMBERS_FILE, 'utf8'));
+        if (Array.isArray(list)) list.forEach((n) => knownNumbers.add(String(n)));
+    } catch (e) { /* tiedostoa ei ole vielä */ }
+
+    String(process.env.KNOWN_NUMBERS || '')
+        .split(',')
+        .map((n) => n.trim())
+        .filter(Boolean)
+        .forEach((n) => knownNumbers.add(n));
+})();
+
+function rememberNumber(number) {
+    number = String(number ?? '').trim();
+    if (!number || knownNumbers.has(number)) return;
+
+    knownNumbers.add(number);
+
+    try {
+        fs.writeFileSync(KNOWN_NUMBERS_FILE, JSON.stringify([...knownNumbers]));
+    } catch (e) {
+        console.log('Tunnettujen numeroiden tallennus epäonnistui:', e.message);
+    }
+}
+
 function bindNumber(socket, number) {
     activeUsers[number] = socket.id;
+    rememberNumber(number);
 
     socket.mobiraInfo = socket.mobiraInfo || {};
     socket.mobiraInfo.phoneNumber = number;
@@ -657,20 +706,25 @@ io.on('connection', (socket) => {
                     `Verkossa: [${Object.keys(activeUsers).join(', ')}]`
                 );
 
+                const everRegistered = knownNumbers.has(targetNumber);
+
                 serverLog(
-                    `Number ${targetNumber} is not registered - call failed`,
+                    everRegistered
+                        ? `Number ${targetNumber} is not reachable (offline) - call failed`
+                        : `Number ${targetNumber} has never been registered - call failed`,
                     'err'
                 );
 
                 inCallUsers.delete(fromNumber);
                 inCallUsers.delete(targetNumber);
 
-                addMissedCall(targetNumber, fromNumber);
+                /* Vastaamaton puhelu vain numerolle, joka oikeasti on olemassa */
+                if (everRegistered) addMissedCall(targetNumber, fromNumber);
 
                 if (callerSocketId) {
                     io.to(callerSocketId).emit('number_unavailable', {
                         targetNumber,
-                        reason: 'offline'
+                        reason: everRegistered ? 'offline' : 'not_registered'
                     });
 
                     /* Katkaistaan puhelu soittajan päässä */
