@@ -76,7 +76,10 @@ function serverLog(msg, kind) {
 const numberNetwork = {};
 
 function networkOf(number) {
-    number = String(number ?? '');
+    number = String(number ?? '').replace(/^\+/, '');
+
+    /* 940- ja 950-alkuiset numerot ovat aina GSM */
+    if (/^(940|950)/.test(number)) return 'GSM';
 
     if (numberNetwork[number]) return numberNetwork[number];
     if (/^210/.test(number)) return 'ARP';
@@ -411,8 +414,43 @@ io.on('connection', (socket) => {
         socket.join('monitors');
 
         if (typeof ack === 'function') {
-            ack({ ok: true, history: logBuffer });
+            ack({ ok: true, history: logBuffer, active: Object.keys(activeUsers) });
         }
+    });
+
+    /* =========================================
+       TUNNETTUJEN NUMEROIDEN SYNKRONOINTI (Serverilogi.html)
+       ========================================= */
+
+    /*
+     * Lokisivu muistaa kaikki numerot, jotka ovat joskus olleet
+     * rekisterissä, ja kertoo ne palvelimelle. Palvelin tallentaa ne
+     * tunnetuiksi: soitto tunnettuun mutta nyt poissa olevaan numeroon
+     * -> reason 'offline' (Ei saada yhteyttä), tuntematon numero
+     * -> 'not_registered' (Ei ole käytössä).
+     */
+    socket.on('sync_known_numbers', (data, ack) => {
+        const reply = (r) => { if (typeof ack === 'function') ack(r); };
+
+        data = data || {};
+
+        if (MONITOR_KEY && data.key !== MONITOR_KEY) {
+            return reply({ ok: false, error: 'Väärä lokiavain' });
+        }
+
+        const list = Array.isArray(data.numbers) ? data.numbers.slice(0, 500) : [];
+        let added = 0;
+
+        list.forEach((n) => {
+            n = String(n ?? '').trim().replace(/^\+/, '');
+            if (!/^\d{3,15}$/.test(n) || knownNumbers.has(n)) return;
+            rememberNumber(n);
+            added++;
+        });
+
+        if (added) serverLog(`Known numbers synced from log: ${added} new`, 'sys');
+
+        reply({ ok: true, added });
     });
 
     /* =========================================
