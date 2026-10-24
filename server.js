@@ -897,8 +897,9 @@ io.on('connection', (socket) => {
 
         /*
          * Palvelunumeroiden (9500…) esto: Serverilogissa estetyltä
-         * numerolta soittoa ei yhdistetä. Puhelin soittaa ilmoituksen
-         * "Tästä liittymästä ei voi soittaa valitsemaanne numeroon".
+         * numerolta soittoa ei yhdistetä. Soittaja kuulee verkon vastaajan
+         * ilmoituksen "Tästä liittymästä ei voi soittaa valitsemaanne numeroon"
+         * (number_unavailable, reason: 'service_blocked').
          */
 
         if (isServiceNumber(targetNumber) && serviceBlocked.includes(fromNumber)) {
@@ -907,7 +908,11 @@ io.on('connection', (socket) => {
                 'warn'
             );
 
-            socket.emit('service_blocked');
+            /* Verkon vastaaja -ilmoitus, kuten "Ei ole käytössä" ja "Ei saada yhteyttä" */
+            socket.emit('number_unavailable', {
+                targetNumber,
+                reason: 'service_blocked'
+            });
 
             return;
         }
