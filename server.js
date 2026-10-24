@@ -64,6 +64,19 @@ let serviceBlocked = [];
  */
 let networkName = '';
 
+/*
+ * Olemassa olevat palvelunumerot (9500…), pilkulla eroteltuna Renderin
+ * ympäristömuuttujassa SERVICE_NUMBERS, esim. "9500123,9500456".
+ * Myös joskus rekisteröitynyt numero (knownNumbers) lasketaan olemassa olevaksi.
+ * Soitto muuhun 9500-numeroon -> "Tämä palvelunumero ei ole enää käytössä".
+ */
+const SERVICE_NUMBERS = new Set(
+    String(process.env.SERVICE_NUMBERS || '')
+        .split(',')
+        .map((n) => n.trim())
+        .filter(Boolean)
+);
+
 function isServiceNumber(n) {
     return String(n ?? '').replace(/^\+/, '').startsWith('9500');
 }
@@ -912,6 +925,29 @@ io.on('connection', (socket) => {
             socket.emit('number_unavailable', {
                 targetNumber,
                 reason: 'service_blocked'
+            });
+
+            return;
+        }
+
+        /*
+         * Palvelunumero, jota ei ole olemassa: ilmoitus kerran, 1 s tauko
+         * ja puhelu katkeaa (puhelin hoitaa katkaisun). Ei hakuviivettä.
+         */
+
+        if (
+            isServiceNumber(targetNumber) &&
+            !SERVICE_NUMBERS.has(targetNumber) &&
+            !knownNumbers.has(targetNumber)
+        ) {
+            serverLog(
+                `Service number ${targetNumber} is not in use - call failed (${fromNumber})`,
+                'err'
+            );
+
+            socket.emit('number_unavailable', {
+                targetNumber,
+                reason: 'service_not_in_use'
             });
 
             return;
