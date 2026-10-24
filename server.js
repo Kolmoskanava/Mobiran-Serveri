@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -25,7 +26,8 @@ const io = new Server(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
-    }
+    },
+    maxHttpBufferSize: 5e6   /* vastaajaviestit (äänitiedosto) kulkevat socketin kautta */
 });
 
 const activeUsers = {};
@@ -301,6 +303,130 @@ function numberOfSocket(socket) {
     }
 
     return null;
+}
+
+/* =========================================
+   VASTAAJA
+   ========================================= */
+
+/*
+ * Kun soitettu numero ei vastaa VOICEMAIL_RING_MS:n kuluessa, soitto katkaistaan
+ * vastaanottajalta (tulee vastaamaton puhelu) ja soittajan puhelin saa
+ * voicemail_prompt-viestin. Puhelin piippaa, äänittää ja lähettää valmiin viestin
+ * (voicemail_send). Vastaanottaja soittaa 777 ja valitsee viestin näppäimellä 1...N.
+ *
+ * Vain puhelimet, jotka ilmoittavat register_device-viestissä supportsVoicemail: true,
+ * saavat vastaajan; muiden soitot toimivat kuten ennen (soi kunnes vastataan).
+ *
+ * Viestit pidetään muistissa ja tallennetaan levylle (VOICEMAIL_DIR). Renderin
+ * ilmaisella tasolla levy nollautuu uudelleenkäynnistyksessä, jolloin viestit katoavat.
+ */
+const VOICEMAIL_RING_MS = Number(process.env.VOICEMAIL_RING_MS) || 25000;
+const VOICEMAIL_PERMIT_MS = 3 * 60 * 1000;      /* viestin lähetysaika äänityksen alusta */
+const VOICEMAIL_MAX_BYTES = 4 * 1024 * 1024;
+const VOICEMAIL_MAX_PER_BOX = 9;                /* puhelin valitsee viestin näppäimillä 1-9 */
+const VOICEMAIL_DIR =
+    process.env.VOICEMAIL_DIR || path.join(__dirname, 'voicemail-data');
+
+const voicemails = {};      /* id -> { id, to, from, ts, mime, duration, played, audio: Buffer } */
+const ringTimers = {};      /* vastaanottajan numero -> ajastin (soitto ilman vastausta) */
+const vmSessions = {};      /* soittajan numero -> numero, jonka vastaajaan viestiä jätetään */
+const vmPermits = {};       /* 'soittaja>vastaanottaja' -> voimassaolon loppu (ms) */
+
+try {
+    fs.mkdirSync(VOICEMAIL_DIR, { recursive: true });
+    fs.readdirSync(VOICEMAIL_DIR).forEach((f) => {
+        if (!f.endsWith('.json')) return;
+        try {
+            const m = JSON.parse(fs.readFileSync(path.join(VOICEMAIL_DIR, f), 'utf8'));
+            m.audio = Buffer.from(m.audio, 'base64');
+            if (m.id && !m.played) voicemails[m.id] = m;
+        } catch (e) { /* viallinen tiedosto ohitetaan */ }
+    });
+} catch (e) {
+    console.log('Vastaajaviestien lataus epäonnistui:', e.message);
+}
+
+function persistVoicemail(m) {
+    fs.writeFile(
+        path.join(VOICEMAIL_DIR, m.id + '.json'),
+        JSON.stringify({ ...m, audio: m.audio.toString('base64') }),
+        () => {}
+    );
+}
+
+function removeVoicemailFile(id) {
+    fs.unlink(path.join(VOICEMAIL_DIR, id + '.json'), () => {});
+}
+
+function unheardVoicemails(number) {
+    return Object.values(voicemails)
+        .filter((m) => m.to === number && !m.played)
+        .sort((a, b) => a.ts - b.ts);
+}
+
+function publicVoicemail(m) {
+    return { id: m.id, from: m.from, ts: m.ts };
+}
+
+function sendVoicemailList(number) {
+    const id = activeUsers[number];
+    if (!id) return;
+    io.to(id).emit('voicemail_list', {
+        messages: unheardVoicemails(number).map(publicVoicemail)
+    });
+}
+
+function clearRingTimer(targetNumber) {
+    if (ringTimers[targetNumber]) {
+        clearTimeout(ringTimers[targetNumber]);
+        delete ringTimers[targetNumber];
+    }
+}
+
+function startVoicemailRingTimer(fromNumber, targetNumber) {
+    const callerSocket = io.sockets.sockets.get(activeUsers[fromNumber]);
+
+    if (
+        !callerSocket ||
+        !callerSocket.mobiraInfo ||
+        callerSocket.mobiraInfo.supportsVoicemail !== true
+    ) return;
+
+    clearRingTimer(targetNumber);
+
+    ringTimers[targetNumber] = setTimeout(() => {
+        delete ringTimers[targetNumber];
+
+        /* Puheluun ehdittiin vastata tai se katkaistiin */
+        if (ringingCalls[targetNumber] !== fromNumber) return;
+
+        delete ringingCalls[targetNumber];
+        inCallUsers.delete(targetNumber);
+        delete callInfo[targetNumber];
+
+        addMissedCall(targetNumber, fromNumber);
+
+        const targetSocketId = activeUsers[targetNumber];
+        if (targetSocketId) io.to(targetSocketId).emit('call_ended');
+
+        const callerSocketId = activeUsers[fromNumber];
+
+        if (!callerSocketId || !inCallUsers.has(fromNumber)) {
+            inCallUsers.delete(fromNumber);
+            return;
+        }
+
+        vmSessions[fromNumber] = targetNumber;
+        vmPermits[fromNumber + '>' + targetNumber] = Date.now() + VOICEMAIL_PERMIT_MS;
+
+        serverLog(
+            `No answer - voicemail offered: ${fromNumber} -> ${targetNumber}`,
+            'warn'
+        );
+
+        io.to(callerSocketId).emit('voicemail_prompt', { targetNumber });
+    }, VOICEMAIL_RING_MS);
 }
 
 /* =========================================
@@ -596,6 +722,8 @@ io.on('connection', (socket) => {
 
             supportsSms: !!(data && data.supportsSms === true),
 
+            supportsVoicemail: !!(data && data.supportsVoicemail === true),
+
             hiddenChannel:
                 !!(
                     data &&
@@ -844,6 +972,8 @@ io.on('connection', (socket) => {
                 network: networkOf(fromNumber)
             });
 
+            startVoicemailRingTimer(fromNumber, targetNumber);
+
             console.log(
                 `Puhelu ${fromNumber} -> ${targetNumber}, kanava: ${callChannel}, verkko: ${networkOf(fromNumber)}`
             );
@@ -859,6 +989,7 @@ io.on('connection', (socket) => {
 
         if (answeringNumber) {
             inCallUsers.add(answeringNumber);
+            clearRingTimer(answeringNumber);
         }
 
         if (
@@ -1004,6 +1135,21 @@ io.on('connection', (socket) => {
                 : null;
 
         /*
+         * Vastaajaviestin jättäminen päättyi: vapautetaan vain soittaja.
+         * Vastaanottajaan ei kosketa (hän on voinut ehtiä toiseen puheluun).
+         */
+        if (thisNumber && targetForLog && vmSessions[thisNumber] === targetForLog) {
+            delete vmSessions[thisNumber];
+            inCallUsers.delete(thisNumber);
+
+            serverLog(
+                `Voicemail recording ended (${thisNumber} -> ${targetForLog})`
+            );
+
+            return;
+        }
+
+        /*
          * Soittaja lopetti ennen kuin vastaanottaja oli tavoitettu:
          * perutaan haku. Vastaanottajan puhelin ei ehtinyt soida,
          * joten vastaamatonta puhelua ei merkitä.
@@ -1057,6 +1203,8 @@ io.on('connection', (socket) => {
                 thisNumber &&
                 ringingCalls[targetNumber] === thisNumber
             ) {
+                clearRingTimer(targetNumber);
+
                 addMissedCall(
                     targetNumber,
                     thisNumber
@@ -1068,6 +1216,7 @@ io.on('connection', (socket) => {
                 thisNumber &&
                 ringingCalls[thisNumber] === targetNumber
             ) {
+                clearRingTimer(thisNumber);
                 delete ringingCalls[thisNumber];
             }
 
@@ -1078,6 +1227,90 @@ io.on('connection', (socket) => {
                 io.to(targetSocketId).emit('call_ended');
             }
         }
+    });
+
+    /* =========================================
+       VASTAAJA
+       ========================================= */
+
+    socket.on('voicemail_sync', () => {
+        const me = numberOfSocket(socket);
+        if (me) sendVoicemailList(me);
+    });
+
+    socket.on('voicemail_send', (data) => {
+        const from = numberOfSocket(socket);
+        data = data || {};
+
+        const to = String(data.targetNumber || '').trim();
+        const permitKey = from + '>' + to;
+
+        if (!from || !to || !(vmPermits[permitKey] > Date.now())) {
+            serverLog(`Voicemail blocked: ${from} -> ${to}`, 'warn');
+            return;
+        }
+
+        delete vmPermits[permitKey];
+
+        const audio = Buffer.isBuffer(data.audio)
+            ? data.audio
+            : (data.audio ? Buffer.from(data.audio) : null);
+
+        if (!audio || !audio.length || audio.length > VOICEMAIL_MAX_BYTES) {
+            serverLog(`Voicemail rejected (size): ${from} -> ${to}`, 'warn');
+            return;
+        }
+
+        if (unheardVoicemails(to).length >= VOICEMAIL_MAX_PER_BOX) {
+            serverLog(`Voicemail box full: ${to}`, 'warn');
+            return;
+        }
+
+        const m = {
+            id: crypto.randomBytes(8).toString('hex'),
+            to,
+            from,
+            ts: Date.now(),
+            mime: String(data.mime || 'audio/webm'),
+            duration: Number(data.duration) || 0,
+            played: false,
+            audio
+        };
+
+        voicemails[m.id] = m;
+        persistVoicemail(m);
+
+        serverLog(
+            `Voicemail left: ${from} -> ${to} (${m.duration} s)`,
+            'ok'
+        );
+
+        const targetSocketId = activeUsers[to];
+        if (targetSocketId) io.to(targetSocketId).emit('voicemail_new', publicVoicemail(m));
+    });
+
+    socket.on('voicemail_get', (data) => {
+        const me = numberOfSocket(socket);
+        const m = data && voicemails[data.id];
+
+        if (!me || !m || m.to !== me || m.played) return;
+
+        socket.emit('voicemail_audio', { id: m.id, mime: m.mime, audio: m.audio });
+    });
+
+    socket.on('voicemail_played', (data) => {
+        const me = numberOfSocket(socket);
+        const m = data && voicemails[data.id];
+
+        if (!me || !m || m.to !== me) return;
+
+        m.played = true;
+        delete voicemails[m.id];
+        removeVoicemailFile(m.id);
+
+        serverLog(`Voicemail heard: ${m.from} -> ${me}`);
+
+        sendVoicemailList(me);
     });
 
     /* =========================================
@@ -1148,6 +1381,9 @@ io.on('connection', (socket) => {
             of Object.entries(activeUsers)
         ) {
             if (id === socket.id) {
+                clearRingTimer(number);
+                delete vmSessions[number];
+
                 /*
                  * Puhelin sammui tai katkesi verkosta kesken puhelun:
                  * katkaistaan puhelu toiselta osapuolelta.
