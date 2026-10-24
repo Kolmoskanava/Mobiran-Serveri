@@ -52,6 +52,22 @@ const logBuffer = [];
  */
 const callInfo = {};
 
+/*
+ * Palvelunumerot (9500…): numerot, joilta soitto palvelunumeroihin on estetty.
+ * Serverilogi asettaa listan (set_service_calls) ja palvelin välittää sen puhelimille.
+ */
+let serviceBlocked = [];
+
+/*
+ * Verkon nimi, jonka Serverilogi asettaa (set_network_name)
+ * ja palvelin välittää puhelimille. Nimi ei ole ohjelmoitu puhelimeen.
+ */
+let networkName = '';
+
+function isServiceNumber(n) {
+    return String(n ?? '').replace(/^\+/, '').startsWith('9500');
+}
+
 function serverLog(msg, kind) {
     const entry = {
         ts: Date.now(),
@@ -80,8 +96,9 @@ const numberNetwork = {};
 function networkOf(number) {
     number = String(number ?? '').replace(/^\+/, '');
 
-    /* 940- ja 950-alkuiset numerot ovat aina GSM */
-    if (/^(940|950)/.test(number)) return 'GSM';
+    /* 940-, 9500- ja 950-alkuiset numerot ovat aina GSM
+       (9500… = palvelunumero, 950… = tilaajanumero) */
+    if (/^(940|9500|950)/.test(number)) return 'GSM';
 
     if (numberNetwork[number]) return numberNetwork[number];
     if (/^210/.test(number)) return 'ARP';
@@ -539,9 +556,75 @@ io.on('connection', (socket) => {
          */
         socket.join('monitors');
 
+        /*
+         * Huom: estolistaa ei palauteta tässä. Serverilogi lähettää oman
+         * estolistansa ja verkon nimensä joka yhteydellä (set_service_calls,
+         * set_network_name), joten tyhjä lista palvelimelta ei ylikirjoita sitä.
+         */
         if (typeof ack === 'function') {
             ack({ ok: true, history: logBuffer, active: Object.keys(activeUsers) });
         }
+    });
+
+    /* =========================================
+       PALVELUNUMEROIDEN ESTO (Serverilogi.html)
+       ========================================= */
+
+    /*
+     * Serverilogi lähettää listan numeroista, joilta soitto
+     * palvelunumeroihin (9500…) on estetty. Palvelin välittää listan
+     * kaikille puhelimille; jokainen puhelin tarkistaa, onko sen oma
+     * numero listalla. Esto tarkistetaan lisäksi start_call-vaiheessa.
+     */
+    socket.on('set_service_calls', (data, ack) => {
+        const reply = (r) => { if (typeof ack === 'function') ack(r); };
+
+        data = data || {};
+
+        if (MONITOR_KEY && data.key !== MONITOR_KEY) {
+            return reply({ ok: false, error: 'Väärä lokiavain' });
+        }
+
+        serviceBlocked = (Array.isArray(data.blocked) ? data.blocked : [])
+            .map((n) => String(n ?? '').trim().replace(/^\+/, ''))
+            .filter((n) => /^\d{3,15}$/.test(n))
+            .slice(0, 500);
+
+        io.emit('service_calls', { blocked: serviceBlocked });
+
+        serverLog(
+            `Service number block list updated: ${serviceBlocked.length} blocked`,
+            'sys'
+        );
+
+        reply({ ok: true });
+    });
+
+    /* =========================================
+       VERKON NIMI (Serverilogi.html)
+       ========================================= */
+
+    /*
+     * Serverilogi lähettää verkon nimen. Palvelin välittää sen
+     * puhelimille (network_name) ja lähettää sen myös jokaiselle
+     * puhelimelle laitteen rekisteröinnin yhteydessä.
+     */
+    socket.on('set_network_name', (data, ack) => {
+        const reply = (r) => { if (typeof ack === 'function') ack(r); };
+
+        data = data || {};
+
+        if (MONITOR_KEY && data.key !== MONITOR_KEY) {
+            return reply({ ok: false, error: 'Väärä lokiavain' });
+        }
+
+        networkName = String(data.name ?? '').toUpperCase().trim().slice(0, 10);
+
+        io.emit('network_name', { name: networkName });
+
+        serverLog(`Network name set: ${networkName}`, 'sys');
+
+        reply({ ok: true });
     });
 
     /* =========================================
@@ -747,6 +830,10 @@ io.on('connection', (socket) => {
             'Laite rekisteröity:',
             socket.mobiraInfo
         );
+
+        /* Verkon nimi ja palvelunumeroiden estolista puhelimelle heti rekisteröinnin jälkeen */
+        socket.emit('network_name', { name: networkName });
+        socket.emit('service_calls', { blocked: serviceBlocked });
     });
 
     /* =========================================
@@ -806,6 +893,23 @@ io.on('connection', (socket) => {
             console.log(
                 `Soittaja ${fromNumber} sidottu sockettiin ${socket.id}`
             );
+        }
+
+        /*
+         * Palvelunumeroiden (9500…) esto: Serverilogissa estetyltä
+         * numerolta soittoa ei yhdistetä. Puhelin soittaa ilmoituksen
+         * "Tästä liittymästä ei voi soittaa valitsemaanne numeroon".
+         */
+
+        if (isServiceNumber(targetNumber) && serviceBlocked.includes(fromNumber)) {
+            serverLog(
+                `Service number call blocked: ${fromNumber} -> ${targetNumber}`,
+                'warn'
+            );
+
+            socket.emit('service_blocked');
+
+            return;
         }
 
         /*
