@@ -345,6 +345,9 @@ function numberOfSocket(socket) {
  * voicemail_prompt-viestin. Puhelin piippaa, äänittää ja lähettää valmiin viestin
  * (voicemail_send). Vastaanottaja soittaa 777 ja valitsee viestin näppäimellä 1...N.
  *
+ * Sama tapahtuu heti, kun soitettu numero on tunnettu mutta offline (puhelin
+ * sammutettu) ja sen vastaaja on päällä.
+ *
  * Vain puhelimet, jotka ilmoittavat register_device-viestissä supportsVoicemail: true,
  * saavat vastaajan; muiden soitot toimivat kuten ennen (soi kunnes vastataan).
  *
@@ -362,6 +365,15 @@ const voicemails = {};      /* id -> { id, to, from, ts, mime, duration, played,
 const ringTimers = {};      /* vastaanottajan numero -> ajastin (soitto ilman vastausta) */
 const vmSessions = {};      /* soittajan numero -> numero, jonka vastaajaan viestiä jätetään */
 const vmPermits = {};       /* 'soittaja>vastaanottaja' -> voimassaolon loppu (ms) */
+
+/* Numerot, joiden vastaaja on VERKKO-ASETUKSISTA pois päältä. Oletus: vastaaja päällä. */
+const voicemailOff = new Set();
+
+function setVoicemailOn(number, on) {
+    if (!number) return;
+    if (on) voicemailOff.delete(String(number));
+    else voicemailOff.add(String(number));
+}
 
 try {
     fs.mkdirSync(VOICEMAIL_DIR, { recursive: true });
@@ -422,6 +434,8 @@ function startVoicemailRingTimer(fromNumber, targetNumber) {
         !callerSocket.mobiraInfo ||
         callerSocket.mobiraInfo.supportsVoicemail !== true
     ) return;
+
+    if (voicemailOff.has(String(targetNumber))) return;   /* vastaaja pois: soi kunnes vastataan */
 
     clearRingTimer(targetNumber);
 
@@ -837,6 +851,12 @@ io.on('connection', (socket) => {
 
         const registeredNumber = numberOfSocket(socket);
         if (registeredNumber && socket.mobiraInfo.supportsSms) smsCapableNumbers.add(registeredNumber);
+
+        /* Vastaaja päällä / pois (VERKKO-ASETUKSET) säilyy palvelimella myös puhelimen sammuttua */
+        if (registeredNumber && data && typeof data.voicemailOn === 'boolean') {
+            setVoicemailOn(registeredNumber, data.voicemailOn);
+        }
+
         if (registeredNumber) deliverQueuedSms(registeredNumber, socket.id);
 
         console.log(
@@ -862,6 +882,15 @@ io.on('connection', (socket) => {
         console.log(
             `Socket ${socket.id} kanava: ${channel}`
         );
+    });
+
+    /* =========================================
+       VASTAAJAN PÄÄLLE / POIS KYTKEMINEN
+       ========================================= */
+
+    socket.on('set_voicemail', (data) => {
+        const n = numberOfSocket(socket);
+        if (n && data && typeof data.on === 'boolean') setVoicemailOn(n, data.on);
     });
 
     /* =========================================
@@ -1061,11 +1090,38 @@ io.on('connection', (socket) => {
                     'err'
                 );
 
-                inCallUsers.delete(fromNumber);
                 inCallUsers.delete(targetNumber);
 
                 /* Vastaamaton puhelu vain numerolle, joka oikeasti on olemassa */
                 if (everRegistered) addMissedCall(targetNumber, fromNumber);
+
+                /*
+                 * Vastaaja: tunnettu numero, vastaaja päällä ja soittajan
+                 * puhelin tukee vastaajaa -> soittaja saa jättää viestin.
+                 */
+                const callerSock = callerSocketId && io.sockets.sockets.get(callerSocketId);
+                const offerVoicemail =
+                    everRegistered &&
+                    !voicemailOff.has(targetNumber) &&
+                    callerSock && callerSock.mobiraInfo &&
+                    callerSock.mobiraInfo.supportsVoicemail === true;
+
+                if (offerVoicemail) {
+                    /* Soittaja pysyy varattuna, kunnes viestin jättäminen päättyy (end_call) */
+                    vmSessions[fromNumber] = targetNumber;
+                    vmPermits[fromNumber + '>' + targetNumber] = Date.now() + VOICEMAIL_PERMIT_MS;
+
+                    serverLog(
+                        `Target offline - voicemail offered: ${fromNumber} -> ${targetNumber}`,
+                        'warn'
+                    );
+
+                    io.to(callerSocketId).emit('voicemail_prompt', { targetNumber });
+
+                    return;
+                }
+
+                inCallUsers.delete(fromNumber);
 
                 if (callerSocketId) {
                     io.to(callerSocketId).emit('number_unavailable', {
